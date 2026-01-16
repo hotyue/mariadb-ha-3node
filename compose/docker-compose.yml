@@ -1,0 +1,128 @@
+version: "3.9"
+
+# ============================================================
+# mariadb-ha-3node - 拓扑骨架
+#
+# 说明：
+# - 本文件只描述“角色与连接关系”
+# - 不保证可直接启动
+# - 所有行为语义以 docs/ 为准
+# ============================================================
+
+services:
+
+  # ------------------------------------------------------------
+  # Node-1 : Primary（正常态唯一写节点）
+  # ------------------------------------------------------------
+  mariadb-node-1:
+    image: mariadb:10.x
+    container_name: mariadb-node-1
+    hostname: node-1
+    networks:
+      - db_net
+    volumes:
+      - node1_data:/var/lib/mysql
+    # 说明：
+    # - 写能力由 ProxySQL 控制
+    # - 不在此处声明任何“主”逻辑
+    # - fencing 可能在宿主机或网络层完成
+
+  # ------------------------------------------------------------
+  # Node-2 : Replica（从节点）
+  # ------------------------------------------------------------
+  mariadb-node-2:
+    image: mariadb:10.x
+    container_name: mariadb-node-2
+    hostname: node-2
+    networks:
+      - db_net
+    volumes:
+      - node2_data:/var/lib/mysql
+    # 说明：
+    # - 默认只读
+    # - 作为候选主之一
+    # - 不自行提升角色
+
+  # ------------------------------------------------------------
+  # Node-3 : Replica + 中立 Quorum 见证
+  # ------------------------------------------------------------
+  mariadb-node-3:
+    image: mariadb:10.x
+    container_name: mariadb-node-3
+    hostname: node-3
+    networks:
+      - db_net
+    volumes:
+      - node3_data:/var/lib/mysql
+    # 说明：
+    # - 中立节点
+    # - 不默认承担写负载
+    # - 提供 Quorum 与 ACK 冗余
+
+  # ------------------------------------------------------------
+  # Orchestrator : 控制面
+  # ------------------------------------------------------------
+  orchestrator:
+    image: openarkcode/orchestrator:latest
+    container_name: orchestrator
+    depends_on:
+      - mariadb-node-1
+      - mariadb-node-2
+      - mariadb-node-3
+    networks:
+      - control_net
+      - db_net
+    volumes:
+      - orchestrator_data:/var/lib/orchestrator
+    # 说明：
+    # - 唯一拓扑事实源
+    # - 负责切主与 fencing 决策
+    # - 不承载业务流量
+
+  # ------------------------------------------------------------
+  # ProxySQL : 数据面入口
+  # ------------------------------------------------------------
+  proxysql:
+    image: proxysql/proxysql:latest
+    container_name: proxysql
+    depends_on:
+      - orchestrator
+    networks:
+      - control_net
+      - db_net
+      - app_net
+    volumes:
+      - proxysql_data:/var/lib/proxysql
+    # 说明：
+    # - 唯一业务入口
+    # - 不判断主从
+    # - 严格消费 facts.json
+    # - 拒写在此完成，而非数据库内阻塞
+
+# ============================================================
+# 网络定义
+# ============================================================
+networks:
+  app_net:
+    driver: bridge
+    # 应用 → ProxySQL
+
+  control_net:
+    driver: bridge
+    # Orchestrator ↔ ProxySQL
+    # facts.json 同步路径所在网络
+
+  db_net:
+    driver: bridge
+    # ProxySQL ↔ MariaDB
+    # MariaDB ↔ MariaDB（复制）
+
+# ============================================================
+# 数据卷（占位）
+# ============================================================
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
+  orchestrator_data:
+  proxysql_data:
