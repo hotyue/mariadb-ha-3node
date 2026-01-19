@@ -22,10 +22,12 @@ wait_mysql_ready() {
   local cname="$1"
 
   for i in {1..30}; do
-    if docker exec "${cname}" mysqladmin ping \
-        -uroot -p"${ROOT_PASSWORD}" --silent >/dev/null 2>&1; then
+    if docker exec "${cname}" mysql \
+        -uroot -p"${ROOT_PASSWORD}" \
+        -e "SELECT 1;" >/dev/null 2>&1; then
       return 0
     fi
+
     sleep 2
   done
 
