@@ -21,6 +21,7 @@ TARGET_DIR="${TARGET_BASE}/mariadb-ha-3node"
 REPO_TARBALL_URL="https://github.com/hotyue/mariadb-ha-3node/archive/refs/heads/main.tar.gz"
 
 log_info()  { printf '[remote][INFO] %s\n'  "$*"; }
+log_warn()  { printf '[remote][WARN] %s\n'  "$*"; }
 log_error() { printf '[remote][ERROR] %s\n' "$*" >&2; }
 
 fail() {
@@ -38,14 +39,24 @@ main() {
   need_cmd curl
   need_cmd tar
 
+  # ---------------------------------------------------------------------------
+  # 1. ensure base directory exists (小白友好：自动创建)
+  # ---------------------------------------------------------------------------
   if [[ ! -d "${TARGET_BASE}" ]]; then
-    fail "base directory not found: ${TARGET_BASE}"
+    log_warn "base directory not found, creating: ${TARGET_BASE}"
+    mkdir -p "${TARGET_BASE}" || fail "failed to create ${TARGET_BASE}"
   fi
 
+  # ---------------------------------------------------------------------------
+  # 2. ensure base directory writable
+  # ---------------------------------------------------------------------------
   if [[ ! -w "${TARGET_BASE}" ]]; then
     fail "base directory not writable: ${TARGET_BASE} (try: sudo)"
   fi
 
+  # ---------------------------------------------------------------------------
+  # 3. prepare project directory
+  # ---------------------------------------------------------------------------
   mkdir -p "${TARGET_DIR}"
 
   log_info "target dir: ${TARGET_DIR}"
@@ -59,6 +70,9 @@ main() {
     fail "download/extract failed"
   fi
 
+  # ---------------------------------------------------------------------------
+  # 4. sanity check
+  # ---------------------------------------------------------------------------
   if [[ ! -f "${TARGET_DIR}/install.sh" ]]; then
     fail "missing file after extract: ${TARGET_DIR}/install.sh"
   fi
