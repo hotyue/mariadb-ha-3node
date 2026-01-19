@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -u -o pipefail
 
 # ============================================================
 # render_facts.sh
@@ -27,8 +27,8 @@ SCHEMA_VERSION=1
 VALID_FOR_SECONDS=10
 
 # ---------- 时间 ----------
-NOW_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-NOW_EPOCH="$(date -u +"%s")"
+NOW_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "1970-01-01T00:00:00Z")"
+NOW_EPOCH="$(date -u +"%s" 2>/dev/null || echo 0)"
 
 # ---------- 默认：拒写态 ----------
 # 任何无法确定的情况，都必须退化为 reject_write
@@ -46,9 +46,7 @@ DECISION_FENCING_REQUIRED=false
 DECISION_FENCED_NODES="[]"
 
 # ---------- 节点事实（占位） ----------
-# 这里先写死结构，后续由你接 Orchestrator API / mysql / orchestrator-client
-NODES_JSON=$(cat <<'EOF'
-{
+NODES_JSON='{
   "node-1": {
     "role": "unknown",
     "reachable": false,
@@ -73,26 +71,29 @@ NODES_JSON=$(cat <<'EOF'
     "gtid_executed": "",
     "replication_lag_seconds": -1
   }
-}
-EOF
-)
+}'
 
 # ============================================================
-# TODO 区域（实现阶段再填）
+# 实现填充区（v1.0.0：保持为空）
 #
-# 在这里，你将来可以：
-# - 调 orchestrator-client
-# - 查 orchestrator backend DB
-# - 解析 mysql 状态
+# 在这里你将来可以：
+#   - 调 orchestrator-client
+#   - 查询 orchestrator backend DB
+#   - 解析 mysql / replication 状态
 #
-# 然后只做一件事：
-#   → 填充上面的 FACT_* 变量
+# 约束：
+#   - 只能修改 FACT_* / DECISION_* 变量
+#   - 任一失败 → 不得 exit
+#   - 不得推断、不补偿、不“猜一个最合理值”
 #
-# 任何失败：
-#   → 保持默认 reject_write 语义
+# 当前版本行为：
+#   - 明确输出 reject_write
 # ============================================================
+
+# （v1.0.0 无实现，保持默认拒写态）
 
 # ---------- 渲染最终 JSON ----------
+# 保证：即使上游完全不可用，这里也能产出完整 JSON
 cat > "${TMP_FILE}" <<EOF
 {
   "schema_version": ${SCHEMA_VERSION},
@@ -120,6 +121,6 @@ cat > "${TMP_FILE}" <<EOF
 EOF
 
 # ---------- 原子替换 ----------
-mv "${TMP_FILE}" "${FACTS_FILE}"
+mv -f "${TMP_FILE}" "${FACTS_FILE}"
 
 exit 0
