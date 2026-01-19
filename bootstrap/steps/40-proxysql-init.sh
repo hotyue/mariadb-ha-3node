@@ -20,7 +20,7 @@ PXA_HOST="127.0.0.1"
 PXA_PORT="6032"
 
 # MariaDB root（用于创建 monitor 账号）
-MYSQL_ROOT_PW="rootpass"
+MARIADB_ROOT_PW="rootpass"
 
 # ProxySQL 监控账号
 MON_USER="monitor"
@@ -36,7 +36,7 @@ HG_READER="20"
 
 proxysql_admin_exec() {
   local sql="$1"
-  docker exec "${PROXYSQL_CONTAINER}" mysql \
+  docker exec "${PROXYSQL_CONTAINER}" mariadb \
     -h "${PXA_HOST}" -P "${PXA_PORT}" \
     -u"${PXA_USER}" -p"${PXA_PW}" \
     -e "${sql}"
@@ -64,7 +64,7 @@ fi
 log_info "waiting for proxysql admin (container-local TCP ${PXA_HOST}:${PXA_PORT})"
 
 for i in {1..40}; do
-  if docker exec "${PROXYSQL_CONTAINER}" mysql \
+  if docker exec "${PROXYSQL_CONTAINER}" mariadb \
        -h "${PXA_HOST}" -P "${PXA_PORT}" \
        -u"${PXA_USER}" -p"${PXA_PW}" \
        -e "SELECT 1;" >/dev/null 2>&1; then
@@ -75,7 +75,7 @@ done
 
 log_info "ensuring monitor user exists on MariaDB master (replicates)"
 
-docker exec mariadb-1 mysql -uroot -p"${MYSQL_ROOT_PW}" -e "
+docker exec mariadb-1 mariadb -uroot -p"${MARIADB_ROOT_PW}" -e "
 CREATE USER IF NOT EXISTS '${MON_USER}'@'%' IDENTIFIED BY '${MON_PW}';
 GRANT USAGE, PROCESS, REPLICATION CLIENT ON *.* TO '${MON_USER}'@'%';
 FLUSH PRIVILEGES;
