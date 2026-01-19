@@ -23,23 +23,23 @@ NODES=(
 #
 # IMPORTANT:
 # - MariaDB 11+/12+ official images no longer guarantee root TCP login
-# - mysqladmin ping WITHOUT credentials uses socket and is stable across versions
+# - mariadb-admin ping WITHOUT credentials uses socket and is stable across versions
 ###############################################################################
 wait_mysql_ready() {
   local cname="$1"
   
-  log_info "waiting for mysql ready: ${cname}"
+  log_info "waiting for mariadb ready: ${cname}"
 
   for i in {1..60}; do
     # 使用 docker logs 来检查 MariaDB 是否准备好
     if docker logs "${cname}" 2>&1 | grep -q "ready for connections"; then
-      log_info "mysql is ready in container: ${cname}"
+      log_info "mariadb is ready in container: ${cname}"
       return 0
     fi
     sleep 5
   done
 
-  log_error "mysql not ready in container: ${cname}"
+  log_error "mariadb not ready in container: ${cname}"
   return 1
 }
 
@@ -78,15 +78,15 @@ for node in "${NODES[@]}"; do
       --log-bin=mysql-bin >/dev/null
   fi
 
-  log_info "waiting for mysql ready: ${node}"
+  log_info "waiting for mariadb ready: ${node}"
 
   if ! wait_mysql_ready "${node}"; then
-    log_error "mysql not ready in container: ${node}"
+    log_error "mariadb not ready in container: ${node}"
     docker logs --tail 50 "${node}" >&2 || true
     exit 1
   fi
 
-  log_info "mysql ready: ${node}"
+  log_info "mariadb ready: ${node}"
 done
 
 log_info "all mariadb nodes are up"
