@@ -1,0 +1,6 @@
+version: "3.8"
+
+networks:
+  mariadb-ha:
+    external: true
+    name: mariadb-ha
