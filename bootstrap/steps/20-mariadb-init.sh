@@ -18,11 +18,18 @@ NODES=(
   "mariadb-3"
 )
 
+###############################################################################
+# MariaDB readiness check
+#
+# IMPORTANT:
+# - MariaDB 11+/12+ official images no longer guarantee root TCP login
+# - mysqladmin ping WITHOUT credentials uses socket and is stable across versions
+###############################################################################
 wait_mysql_ready() {
   local cname="$1"
 
-  for i in {1..60}; do
-    if docker exec "${cname}" mysql -uroot -p"${ROOT_PASSWORD}" -e "SELECT 1;" >/dev/null 2>&1; then
+  for i in {1..90}; do
+    if docker exec "${cname}" mysqladmin ping >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
@@ -59,7 +66,7 @@ for node in "${NODES[@]}"; do
     docker run -d \
       --name "${node}" \
       --network "${NETWORK_NAME}" \
-      -e MYSQL_ROOT_PASSWORD="${ROOT_PASSWORD}" \
+      -e MARIADB_ROOT_PASSWORD="${ROOT_PASSWORD}" \
       -v "${node}-data:/var/lib/mysql" \
       "${IMAGE}" \
       --server-id="${SERVER_ID}" \
@@ -70,6 +77,7 @@ for node in "${NODES[@]}"; do
 
   if ! wait_mysql_ready "${node}"; then
     log_error "mysql not ready in container: ${node}"
+    docker logs --tail 50 "${node}" >&2 || true
     exit 1
   fi
 
