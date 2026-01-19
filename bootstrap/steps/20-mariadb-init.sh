@@ -46,7 +46,7 @@ wait_mysql_ready() {
 for node in "${NODES[@]}"; do
   log_info "processing mariadb node: ${node}"
 
-  # ===== 固化 server-id（关键）=====
+  # 固化 server-id（关键）
   case "${node}" in
     mariadb-1) SERVER_ID=1 ;;
     mariadb-2) SERVER_ID=2 ;;
@@ -56,8 +56,8 @@ for node in "${NODES[@]}"; do
       exit 1
       ;;
   esac
-  # ==================================
 
+  # 判断容器是否存在，存在则启动，否则创建
   if docker ps -a --format '{{.Names}}' | grep -qx "${node}"; then
     if docker ps --format '{{.Names}}' | grep -qx "${node}"; then
       log_info "container already running: ${node}"
@@ -67,7 +67,6 @@ for node in "${NODES[@]}"; do
     fi
   else
     log_info "creating mariadb container: ${node} (server-id=${SERVER_ID})"
-
     docker run -d \
       --name "${node}" \
       --network "${NETWORK_NAME}" \
@@ -78,8 +77,8 @@ for node in "${NODES[@]}"; do
       --log-bin=mysql-bin >/dev/null
   fi
 
+  # 等待 MariaDB 容器准备就绪
   log_info "waiting for mariadb ready: ${node}"
-
   if ! wait_mysql_ready "${node}"; then
     log_error "mariadb not ready in container: ${node}"
     docker logs --tail 50 "${node}" >&2 || true
