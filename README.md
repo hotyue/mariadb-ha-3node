@@ -76,8 +76,23 @@
 
 ## 三、仓库结构说明
 
-
-
+```text
+mariadb-ha-3node/
+├── bootstrap/ # 初始化入口与分阶段脚本
+│ ├── entrypoint.sh
+│ ├── lib/
+│ └── steps/
+├── runtime/ # 运行态运维脚本
+│ ├── start.sh
+│ ├── stop.sh
+│ └── status.sh
+├── healthcheck/ # 运行态健康检查
+│ └── proxysql.sh
+├── verify/ # 功能验证脚本
+│ └── 02-readwrite.sh
+├── docker/ # Docker / Compose 相关文件
+└── README.md
+```
 
 ---
 
