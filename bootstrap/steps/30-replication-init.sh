@@ -15,30 +15,30 @@ REPL_PW="replpass"
 MASTER="mariadb-1"
 SLAVES=("mariadb-2" "mariadb-3")
 
-mysql_exec() {
+mariadb_exec() {
   local node="$1"
   local sql="$2"
-  docker exec "${node}" mysql -uroot -p"${ROOT_PW}" -e "${sql}"
+  docker exec "${node}" mariadb -uroot -p"${ROOT_PW}" -e "${sql}"
 }
 
-mysql_query_value() {
+mariadb_query_value() {
   local node="$1"
   local sql="$2"
-  docker exec "${node}" mysql -uroot -p"${ROOT_PW}" -Nse "${sql}"
+  docker exec "${node}" mariadb -uroot -p"${ROOT_PW}" -Nse "${sql}"
 }
 
 log_info "setting server-id on all nodes"
 
-mysql_exec "${MASTER}" "SET GLOBAL server_id = 1;"
-mysql_exec "mariadb-2" "SET GLOBAL server_id = 2;"
-mysql_exec "mariadb-3" "SET GLOBAL server_id = 3;"
+mariadb_exec "${MASTER}" "SET GLOBAL server_id = 1;"
+mariadb_exec "mariadb-2" "SET GLOBAL server_id = 2;"
+mariadb_exec "mariadb-3" "SET GLOBAL server_id = 3;"
 
 log_info "checking binlog status on master"
-mysql_exec "${MASTER}" "SHOW VARIABLES LIKE 'log_bin';"
+mariadb_exec "${MASTER}" "SHOW VARIABLES LIKE 'log_bin';"
 
 log_info "creating replication user on master"
 
-mysql_exec "${MASTER}" "
+mariadb_exec "${MASTER}" "
 CREATE USER IF NOT EXISTS '${REPL_USER}'@'%' IDENTIFIED BY '${REPL_PW}';
 GRANT REPLICATION SLAVE ON *.* TO '${REPL_USER}'@'%';
 FLUSH PRIVILEGES;
@@ -46,7 +46,7 @@ FLUSH PRIVILEGES;
 
 log_info "configuring replication on slaves"
 
-STATUS=$(mysql_exec "${MASTER}" "SHOW MASTER STATUS\G")
+STATUS=$(mariadb_exec "${MASTER}" "SHOW MASTER STATUS\G")
 LOG_FILE=$(echo "${STATUS}" | awk '/File:/ {print $2}')
 LOG_POS=$(echo "${STATUS}" | awk '/Position:/ {print $2}')
 
@@ -56,14 +56,14 @@ if [[ -z "${LOG_FILE}" || -z "${LOG_POS}" ]]; then
 fi
 
 for slave in "${SLAVES[@]}"; do
-  if mysql_exec "${slave}" "SHOW SLAVE STATUS\G" | grep -q "Slave_IO_State"; then
+  if mariadb_exec "${slave}" "SHOW SLAVE STATUS\G" | grep -q "Slave_IO_State"; then
     log_info "replication already configured on ${slave}, skipping"
     continue
   fi
 
   log_info "initializing replication on ${slave}"
 
-  mysql_exec "${slave}" "
+  mariadb_exec "${slave}" "
 STOP SLAVE;
 CHANGE MASTER TO
   MASTER_HOST='${MASTER}',
@@ -77,12 +77,12 @@ done
 
 log_info "enabling semi-synchronous replication (MariaDB built-in)"
 
-mysql_exec "${MASTER}" "
+mariadb_exec "${MASTER}" "
 SET GLOBAL rpl_semi_sync_master_enabled = 1;
 "
 
 for slave in "${SLAVES[@]}"; do
-  mysql_exec "${slave}" "
+  mariadb_exec "${slave}" "
 SET GLOBAL rpl_semi_sync_slave_enabled = 1;
 "
 done
@@ -90,7 +90,7 @@ done
 log_info "verifying replication status"
 
 for slave in "${SLAVES[@]}"; do
-  STATUS=$(mysql_exec "${slave}" "SHOW SLAVE STATUS\G")
+  STATUS=$(mariadb_exec "${slave}" "SHOW SLAVE STATUS\G")
   echo "${STATUS}" | grep -q "Slave_IO_Running: Yes"
   echo "${STATUS}" | grep -q "Slave_SQL_Running: Yes"
   log_info "replication running on ${slave}"
