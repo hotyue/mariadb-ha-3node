@@ -9,7 +9,7 @@ LIB_DIR="${BOOTSTRAP_DIR}/lib"
 source "${LIB_DIR}/log.sh"
 
 NETWORK_NAME="mariadb-ha"
-IMAGE="mariadb:10.11"
+IMAGE="mariadb:latest"
 ROOT_PASSWORD="rootpass"
 
 NODES=(
