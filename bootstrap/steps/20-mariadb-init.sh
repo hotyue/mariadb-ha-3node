@@ -27,14 +27,19 @@ NODES=(
 ###############################################################################
 wait_mysql_ready() {
   local cname="$1"
+  
+  log_info "waiting for mysql ready: ${cname}"
 
-  for i in {1..90}; do
-    if docker exec "${cname}" mysqladmin ping >/dev/null 2>&1; then
+  for i in {1..60}; do
+    # 使用 docker logs 来检查 MariaDB 是否准备好
+    if docker logs "${cname}" 2>&1 | grep -q "ready for connections"; then
+      log_info "mysql is ready in container: ${cname}"
       return 0
     fi
-    sleep 2
+    sleep 5
   done
 
+  log_error "mysql not ready in container: ${cname}"
   return 1
 }
 
