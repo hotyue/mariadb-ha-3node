@@ -3,100 +3,131 @@ set -euo pipefail
 
 ###############################################################################
 # install.sh
-# v1.1.1 one-command installer (wrapper only)
+# v1.1.2 one-command installer
+# 职责：协调环境检查、自动化部署及运行状态验证
 ###############################################################################
 
 PHASE_TOTAL=3
 
-log_info()  { printf '[install][INFO] %s\n'  "$*"; }
-log_warn()  { printf '[install][WARN] %s\n'  "$*"; }
-log_error() { printf '[install][ERROR] %s\n' "$*" >&2; }
+# 终端颜色定义
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+log_info()  { printf "[install][INFO] %s\n"  "$*"; }
+log_warn()  { printf "[install][WARN] ${YELLOW}%s${NC}\n"  "$*"; }
+log_error() { printf "[install][ERROR] ${RED}%s${NC}\n" "$*" >&2; }
 
 phase_start() {
-  printf '[install][PHASE %s/%s] %s...\n' "$1" "$PHASE_TOTAL" "$2"
+  printf '\n${YELLOW}[install][PHASE %s/%s] %s...${NC}\n' "$1" "$PHASE_TOTAL" "$2"
 }
 
 phase_ok() {
-  printf '[install][PHASE %s/%s] OK: %s\n' "$1" "$PHASE_TOTAL" "$2"
+  printf '${GREEN}[install][PHASE %s/%s] OK: %s${NC}\n' "$1" "$PHASE_TOTAL" "$2"
 }
 
 phase_fail() {
-  printf '[install][PHASE %s/%s] FAILED: %s\n' "$1" "$PHASE_TOTAL" "$2" >&2
+  printf '${RED}[install][PHASE %s/%s] FAILED: %s${NC}\n' "$1" "$PHASE_TOTAL" "$2" >&2
 }
 
 ###############################################################################
-# PHASE 1: prerequisites
+# PHASE 1: Prerequisites Check
 ###############################################################################
-phase_start 1 "prerequisites check"
+phase_start 1 "Prerequisites check"
 
+# 1. 权限提醒
+if [[ $EUID -ne 0 ]]; then
+   log_warn "Current user is not root. If docker requires sudo, this may fail."
+fi
+
+# 2. Docker 环境检查
 if ! command -v docker >/dev/null 2>&1; then
-  log_error "docker not found in PATH"
-  phase_fail 1 "prerequisites check"
+  log_error "Docker not found. Please install docker first."
+  phase_fail 1 "Prerequisites check"
   exit 1
 fi
-log_info "docker found"
+log_info "Docker found"
 
 if ! docker ps >/dev/null 2>&1; then
-  log_error "docker daemon not reachable (try: systemctl start docker)"
-  phase_fail 1 "prerequisites check"
+  log_error "Docker daemon not reachable. Ensure docker service is started."
+  phase_fail 1 "Prerequisites check"
   exit 1
 fi
-log_info "docker daemon reachable"
+log_info "Docker daemon reachable"
 
-if [[ ! -f "./bootstrap/entrypoint.sh" ]]; then
-  log_error "missing file: bootstrap/entrypoint.sh"
-  phase_fail 1 "prerequisites check"
-  exit 1
-fi
-log_info "bootstrap entrypoint found"
+# 3. 脚本执行权限自动修复
+log_info "Ensuring all scripts are executable..."
+find . -name "*.sh" -exec chmod +x {} +
 
-if [[ ! -f "./runtime/start.sh" ]]; then
-  log_error "missing file: runtime/start.sh"
-  phase_fail 1 "prerequisites check"
-  exit 1
-fi
-log_info "runtime start script found"
+# 4. 核心组件存在性检查
+ESSENTIAL_FILES=(
+  "./bootstrap/entrypoint.sh"
+  "./bootstrap/lib/mysql.sh"
+  "./runtime/start.sh"
+  "./runtime/status.sh"
+)
 
-phase_ok 1 "prerequisites check"
+for f in "${ESSENTIAL_FILES[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    log_error "Critical file missing: $f"
+    phase_fail 1 "Prerequisites check"
+    exit 1
+  fi
+done
+log_info "All essential scripts found"
+
+phase_ok 1 "Prerequisites check"
 
 ###############################################################################
-# PHASE 2: bootstrap
+# PHASE 2: Bootstrap (Infrastructure Setup)
 ###############################################################################
-phase_start 2 "bootstrap"
+phase_start 2 "Bootstrap"
 
-log_info "running: bootstrap/entrypoint.sh"
-if ! bash ./bootstrap/entrypoint.sh; then
+log_info "Executing: ./bootstrap/entrypoint.sh"
+# 启动引导程序，包括网络创建、容器启动、同步配置、代理设置
+if ! ./bootstrap/entrypoint.sh; then
   rc=$?
-  phase_fail 2 "bootstrap"
-  log_error "bootstrap failed (exit=${rc})"
-  log_error "see logs above"
+  phase_fail 2 "Bootstrap"
+  log_error "Bootstrap failed with exit code ${rc}"
   exit "${rc}"
 fi
 
-phase_ok 2 "bootstrap"
+phase_ok 2 "Bootstrap"
 
 ###############################################################################
-# PHASE 3: runtime start
+# PHASE 3: Runtime Verification
 ###############################################################################
-phase_start 3 "runtime start"
+phase_start 3 "Runtime Status Verification"
 
-log_info "running: runtime/start.sh"
-if ! bash ./runtime/start.sh; then
+log_info "Executing: ./runtime/status.sh"
+# 引导完成后，直接通过状态脚本检查集群当前的整体健康度
+if ! ./runtime/status.sh; then
   rc=$?
-  phase_fail 3 "runtime start"
-  log_error "runtime start failed (exit=${rc})"
-  log_error "see logs above"
+  phase_fail 3 "Runtime Verification"
+  log_error "Final status check failed with exit code ${rc}"
   exit "${rc}"
 fi
 
-phase_ok 3 "runtime start"
+phase_ok 3 "Runtime Status Verification"
 
 ###############################################################################
-# SUCCESS
+# Final Summary
 ###############################################################################
-log_info "all done"
-log_info "next: check status via: ./runtime/status.sh"
-log_info "next: stop via: ./runtime/stop.sh"
-log_info "optional: verification scripts under ./verify/"
+echo -e "\n${GREEN}==============================================================="
+echo "  MariaDB HA Cluster (3-Node) Deployment Completed!"
+echo -e "===============================================================${NC}"
+
+log_info "Quick Commands:"
+log_info "  - Check Cluster:  ./runtime/status.sh"
+log_info "  - Stop Cluster:   ./runtime/stop.sh"
+log_info "  - Start Cluster:  ./runtime/start.sh"
+log_info ""
+log_info "Verification:"
+log_info "  - Test Read/Write: ./verify/02-readwrite.sh"
+log_info "  - Test Failover:   ./verify/03-failover.sh"
+log_info ""
+log_info "Web UI:"
+log_info "  - Orchestrator: http://localhost:3000"
 
 exit 0

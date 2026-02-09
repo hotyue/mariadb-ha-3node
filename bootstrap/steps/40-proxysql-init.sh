@@ -7,33 +7,33 @@ LIB_DIR="${BOOTSTRAP_DIR}/lib"
 
 # shellcheck source=../lib/log.sh
 source "${LIB_DIR}/log.sh"
+# shellcheck source=../lib/mysql.sh
+source "${LIB_DIR}/mysql.sh"
 
 NETWORK_NAME="mariadb-ha"
 
 PROXYSQL_CONTAINER="proxysql"
 PROXYSQL_IMAGE="proxysql/proxysql:2.6.0"
 
-# ProxySQL Admin（容器内 TCP）
+# ProxySQL Admin（容器内 TCP 访问其管理接口）
 PXA_USER="admin"
 PXA_PW="admin"
 PXA_HOST="127.0.0.1"
 PXA_PORT="6032"
 
-# MariaDB root（用于创建 monitor 账号）
-MARIADB_ROOT_PW="rootpass"
-
-# ProxySQL 监控账号
+# ProxySQL 监控账号（在 MariaDB 中创建）
 MON_USER="monitor"
 MON_PW="monitorpass"
 
-# 应用账号（连 6033）
+# 应用账号（通过 6033 访问数据库）
 APP_USER="app"
 APP_PW="apppass"
 
-# Hostgroups
+# Hostgroups 路由定义
 HG_WRITER="10"
 HG_READER="20"
 
+# 内部函数：通过 ProxySQL Admin 接口执行 SQL
 proxysql_admin_exec() {
   local sql="$1"
   docker exec "${PROXYSQL_CONTAINER}" mariadb \
@@ -53,7 +53,6 @@ if docker ps -a --format '{{.Names}}' | grep -qx "${PROXYSQL_CONTAINER}"; then
   fi
 else
   log_info "creating proxysql container: ${PROXYSQL_CONTAINER}"
-
   docker run -d \
     --name "${PROXYSQL_CONTAINER}" \
     --network "${NETWORK_NAME}" \
@@ -75,15 +74,16 @@ done
 
 log_info "ensuring monitor user exists on MariaDB master (replicates)"
 
-docker exec mariadb-1 mariadb -uroot -p"${MARIADB_ROOT_PW}" -e "
+# 使用 mysql_exec_local 避开 MariaDB root 密码验证问题
+mysql_exec_local mariadb-1 "
 CREATE USER IF NOT EXISTS '${MON_USER}'@'%' IDENTIFIED BY '${MON_PW}';
 GRANT USAGE, PROCESS, REPLICATION CLIENT ON *.* TO '${MON_USER}'@'%';
 FLUSH PRIVILEGES;
-" >/dev/null
+"
 
 log_info "configuring proxysql (admin via TCP)"
 
-# 1) 全局变量：监控账号（幂等）
+# 1) 全局变量：配置监控账号（用于 ProxySQL 检查后端存活）
 proxysql_admin_exec "
 REPLACE INTO global_variables(variable_name, variable_value) VALUES
  ('mysql-monitor_username','${MON_USER}'),
@@ -92,7 +92,7 @@ LOAD MYSQL VARIABLES TO RUNTIME;
 SAVE MYSQL VARIABLES TO DISK;
 "
 
-# 2) 后端节点（幂等）
+# 2) 后端节点：配置读写 Hostgroups
 proxysql_admin_exec "
 REPLACE INTO mysql_servers(hostgroup_id, hostname, port, weight, max_connections) VALUES
  (${HG_WRITER}, 'mariadb-1', 3306, 1000, 200),
@@ -102,7 +102,7 @@ LOAD MYSQL SERVERS TO RUNTIME;
 SAVE MYSQL SERVERS TO DISK;
 "
 
-# 3) 业务用户（幂等）
+# 3) 业务用户：创建供应用连接的代理账号
 proxysql_admin_exec "
 REPLACE INTO mysql_users(username, password, default_hostgroup, active, transaction_persistent)
 VALUES ('${APP_USER}', '${APP_PW}', ${HG_WRITER}, 1, 1);
@@ -110,7 +110,7 @@ LOAD MYSQL USERS TO RUNTIME;
 SAVE MYSQL USERS TO DISK;
 "
 
-# 4) 读写分离规则（幂等，最小实现）
+# 4) 读写分离规则：SELECT 路由到读组
 proxysql_admin_exec "
 REPLACE INTO mysql_query_rules(rule_id, active, match_pattern, destination_hostgroup, apply)
 VALUES (1, 1, '^[[:space:]]*SELECT', ${HG_READER}, 1);
