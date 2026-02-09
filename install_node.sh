@@ -46,16 +46,14 @@ echo -e " 节点 IP:  ${GREEN}${MY_IP}${NC} (ServerID: ${SERVER_ID})"
 echo "=========================================================="
 echo ""
 
-# 2. 安全交互：获取密码 (修复点：强制从 tty 读取)
+# 2. 安全交互：获取密码 (保持 < /dev/tty 修复)
 echo ">>> 请输入集群密码 (输入不显示)"
 echo "----------------------------------------------------------"
 
-# [关键修复] 添加 < /dev/tty
 read -s -p "1. 输入 Root 密码 (DB_ROOT_PASS): " ROOT_PASS < /dev/tty
 echo ""
 if [ -z "$ROOT_PASS" ]; then echo "密码不能为空"; exit 1; fi
 
-# Master 节点额外询问 ProxySQL 密码
 if [ "$MY_ROLE" == "MASTER" ]; then
     read -s -p "2. 输入 ProxySQL Admin 密码:      " PROXY_ADMIN_PASS < /dev/tty
     echo ""
@@ -69,19 +67,20 @@ docker rm -f mariadb proxysql adminer >/dev/null 2>&1 || true
 
 # 4. 部署 MariaDB (所有节点)
 log "启动 MariaDB (${MARIADB_IMAGE})..."
-# 注意：使用 host 网络模式
+
+# [关键修复] 将数据库参数移到镜像名之后
 docker run -d \
     --name mariadb \
     --restart unless-stopped \
     --network host \
     -e MYSQL_ROOT_PASSWORD="${ROOT_PASS}" \
     -e MYSQL_INITDB_SKIP_TZINFO=yes \
+    "${MARIADB_IMAGE}" \
     --server-id="${SERVER_ID}" \
     --log-bin=mysql-bin \
     --binlog-format=ROW \
     --gtid-domain-id="${SERVER_ID}" \
-    --bind-address=0.0.0.0 \
-    "${MARIADB_IMAGE}" >/dev/null
+    --bind-address=0.0.0.0 >/dev/null
 
 # 5. 部署中间件 (仅 Master)
 if [ "$MY_ROLE" == "MASTER" ]; then
@@ -101,4 +100,10 @@ if [ "$MY_ROLE" == "MASTER" ]; then
         "${PROXYSQL_IMAGE}" >/dev/null
 fi
 
+echo ""
 log "安装完成！请确保防火墙已放行端口 ${DB_PORT}。"
+if [ "$MY_ROLE" == "MASTER" ]; then
+    echo "   - ProxySQL Admin: ${PROXY_ADMIN_PORT}"
+    echo "   - ProxySQL Query: ${PROXY_QUERY_PORT}"
+    echo "   - Adminer UI:     ${ADMINER_PORT}"
+fi
