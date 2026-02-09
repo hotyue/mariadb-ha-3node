@@ -12,8 +12,10 @@ source "${LIB_DIR}/mysql.sh"
 
 NETWORK_NAME="mariadb-ha"
 ORC_CONTAINER="orchestrator"
-# 修正：使用具体版本号，官方仓库没有 latest 标签
-ORC_IMAGE="openark/orchestrator:3.2.6"
+
+# 核心修正：官方 openark 仓库已废弃且无此 tag。
+# 切换到社区维护的稳定版镜像，解决 pull access denied 问题。
+ORC_IMAGE="hamishforbes/orchestrator:3.2.6"
 
 # Orchestrator 在 MariaDB 中使用的拓扑探测账号
 ORC_USER="orc_admin"
