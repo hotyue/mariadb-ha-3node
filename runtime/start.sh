@@ -2,11 +2,13 @@
 set -euo pipefail
 
 NETWORK="mariadb-ha"
+# 按照启动依赖排序
 CONTAINERS=(
   mariadb-1
   mariadb-2
   mariadb-3
   proxysql
+  orchestrator
 )
 
 log() {

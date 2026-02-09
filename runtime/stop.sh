@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 按照停止优先级排序（上层先停）
 CONTAINERS=(
+  orchestrator
   proxysql
   mariadb-3
   mariadb-2

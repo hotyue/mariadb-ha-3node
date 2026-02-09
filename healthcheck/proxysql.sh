@@ -33,7 +33,7 @@ fi
 
 log "checking runtime connectivity (${RUNTIME_HOST}:${RUNTIME_PORT})"
 
-if ! docker exec "${PROXYSQL_CONTAINER}" mysql \
+if ! docker exec "${PROXYSQL_CONTAINER}" mariadb \
      -h "${RUNTIME_HOST}" -P "${RUNTIME_PORT}" \
      -u"${APP_USER}" -p"${APP_PW}" \
      -e "SELECT 1;" >/dev/null 2>&1; then
