@@ -1,54 +1,94 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "${ROOT_DIR}/bootstrap/lib/log.sh"
-source "${ROOT_DIR}/bootstrap/lib/mysql.sh"
+# 1. 环境定位
+VERIFY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${VERIFY_DIR}/.." && pwd)"
+LIB_DIR="${ROOT_DIR}/bootstrap/lib"
 
-PROXYSQL_CONTAINER="proxysql"
+# 2. 加载基础库 (用于日志和直连 Master)
+source "${LIB_DIR}/log.sh"
+source "${LIB_DIR}/mysql.sh"
+
+# 3. 配置信息
+PROXY_CONTAINER="proxysql"
 APP_USER="app"
 APP_PW="apppass"
-MASTER="mariadb-1"
-SLAVES=("mariadb-2" "mariadb-3")
+TEST_DB="test_rw_split"
+TEST_TABLE="traffic_log"
 
-TEST_DB="proxysql_verify"
-TEST_TABLE="rw_test"
+# 颜色定义
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-# 内部函数：通过 ProxySQL 业务端口执行
-run_via_proxysql() {
-  docker exec -i "${PROXYSQL_CONTAINER}" mariadb \
-    -h 127.0.0.1 -P 6033 -u"${APP_USER}" -p"${APP_PW}" -Nse "$1"
-}
+log_info "Starting Read/Write Split Verification..."
 
-log_info "preparing test schema via ProxySQL (write path)"
+# --- Step 1: 准备环境 (使用 Root 在 Master 操作) ---
+# 确保数据库存在，且 app 用户有权限
+log_info "[1/4] Preparing test schema on Master..."
+mysql_exec_local "mariadb-1" "CREATE DATABASE IF NOT EXISTS ${TEST_DB};"
+mysql_exec_local "mariadb-1" "GRANT ALL PRIVILEGES ON ${TEST_DB}.* TO '${APP_USER}'@'%';"
+mysql_exec_local "mariadb-1" "
+  CREATE TABLE IF NOT EXISTS ${TEST_DB}.${TEST_TABLE} (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    source_node VARCHAR(50),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );"
 
-# 使用 root 权限在 Master 预先创建数据库和用户权限（确保 app 用户有权访问）
-mysql_exec_local "${MASTER}" "
-CREATE DATABASE IF NOT EXISTS ${TEST_DB};
-GRANT ALL ON ${TEST_DB}.* TO '${APP_USER}'@'%';
-"
+# --- Step 2: 测试写入 (Write -> Master) ---
+log_info "[2/4] Testing WRITE traffic via ProxySQL (Port 6033)..."
+log_info "      Sending INSERT requests..."
 
-run_via_proxysql "
-CREATE TABLE IF NOT EXISTS ${TEST_DB}.${TEST_TABLE} (
-  id INT PRIMARY KEY AUTO_INCREMENT,
-  note VARCHAR(64)
-);
-INSERT INTO ${TEST_DB}.${TEST_TABLE}(note) VALUES ('proxysql-rw-test');
-"
+# 通过 ProxySQL 插入数据，并记录是哪个节点处理了插入操作
+for i in {1..3}; do
+  # 使用 mysql -e 执行插入
+  docker exec "${PROXY_CONTAINER}" mysql -u"${APP_USER}" -p"${APP_PW}" -h127.0.0.1 -P6033 -e \
+    "INSERT INTO ${TEST_DB}.${TEST_TABLE} (source_node) VALUES (@@hostname);"
+done
 
-log_info "verifying write reached master"
-MASTER_COUNT=$(mysql_query_value "${MASTER}" "SELECT COUNT(*) FROM ${TEST_DB}.${TEST_TABLE} WHERE note='proxysql-rw-test';")
-
-if [[ "${MASTER_COUNT}" != "1" ]]; then
-  log_error "write not found on master"
+# 验证 Master 是否收到了数据
+MASTER_COUNT=$(mysql_query_value "mariadb-1" "SELECT COUNT(*) FROM ${TEST_DB}.${TEST_TABLE};")
+if [[ "${MASTER_COUNT}" -ge 3 ]]; then
+  log_info "      [OK] Master (mariadb-1) confirms ${MASTER_COUNT} records."
+else
+  log_error "     [FAIL] Master missing records! Found: ${MASTER_COUNT}"
   exit 1
 fi
 
-log_info "verifying read distribution via ProxySQL"
-# 连续执行 5 次查询，观察是否从 Slave 读取（ProxySQL 路由规则）
-for i in {1..5}; do
-    SID=$(run_via_proxysql "SELECT @@server_id;")
-    log_info "  - Query $i handled by server_id: ${SID}"
-done
+# --- Step 3: 测试读取 (Read -> Slaves) ---
+log_info "[3/4] Testing READ traffic via ProxySQL (Port 6033)..."
+log_info "      Sending SELECT requests (Should hit Slaves)..."
 
-log_info "read/write split verification passed"
+echo ""
+echo -e "   | Req | Traffic Type | Handled By Node | Expected Role | Status |"
+echo "   |-----|--------------|-----------------|---------------|--------|"
+
+# 循环读取 6 次，观察负载均衡效果
+for i in {1..6}; do
+  # 查询 @@hostname 看看请求被路由到了哪里
+  # -Nse: 去头、静默、原始输出
+  HANDLER=$(docker exec "${PROXY_CONTAINER}" mysql -u"${APP_USER}" -p"${APP_PW}" -h127.0.0.1 -P6033 -Nse \
+    "SELECT @@hostname")
+  
+  # 判断逻辑
+  if [[ "$HANDLER" == "mariadb-1" ]]; then
+      ROLE="Master"
+      # 如果读到了 Master，标黄 (可能是 ProxySQL 配置允许读 Master，或者从库延迟)
+      STATUS="${YELLOW}Writer${NC}" 
+  else
+      ROLE="Slave"
+      # 如果读到了 Slave，标绿 (完美的读写分离)
+      STATUS="${GREEN}Reader${NC}"
+  fi
+  
+  printf "   | %-3s | %-12s | %-15s | %-13s | %-6s |\n" "$i" "SELECT" "$HANDLER" "$ROLE" "$STATUS"
+done
+echo ""
+
+# --- Step 4: 清理 ---
+log_info "[4/4] Cleaning up..."
+mysql_exec_local "mariadb-1" "DROP DATABASE IF EXISTS ${TEST_DB};"
+
+log_info "Verification Completed Successfully!"
