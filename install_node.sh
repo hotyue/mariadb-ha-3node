@@ -18,7 +18,7 @@ NC='\033[0m'
 log() { echo -e "${BLUE}[INFO]${NC} $1"; }
 warn() { echo -e "${RED}[WARN]${NC} $1"; }
 
-# 1. 角色识别 (Identity Check)
+# 1. 角色识别
 LOCAL_IPS=$(hostname -I)
 MY_ROLE="UNKNOWN"
 MY_IP=""
@@ -38,7 +38,6 @@ else
     exit 1
 fi
 
-# 2. 从 IP 生成唯一的 Server ID (取 IP 最后一段)
 SERVER_ID=$(echo "$MY_IP" | awk -F. '{print $4}')
 
 echo "=========================================================="
@@ -47,28 +46,30 @@ echo -e " 节点 IP:  ${GREEN}${MY_IP}${NC} (ServerID: ${SERVER_ID})"
 echo "=========================================================="
 echo ""
 
-# 3. 安全交互：获取密码
+# 2. 安全交互：获取密码 (修复点：强制从 tty 读取)
 echo ">>> 请输入集群密码 (输入不显示)"
 echo "----------------------------------------------------------"
 
-read -s -p "1. 输入 Root 密码 (DB_ROOT_PASS): " ROOT_PASS
+# [关键修复] 添加 < /dev/tty
+read -s -p "1. 输入 Root 密码 (DB_ROOT_PASS): " ROOT_PASS < /dev/tty
 echo ""
 if [ -z "$ROOT_PASS" ]; then echo "密码不能为空"; exit 1; fi
 
 # Master 节点额外询问 ProxySQL 密码
 if [ "$MY_ROLE" == "MASTER" ]; then
-    read -s -p "2. 输入 ProxySQL Admin 密码:      " PROXY_ADMIN_PASS
+    read -s -p "2. 输入 ProxySQL Admin 密码:      " PROXY_ADMIN_PASS < /dev/tty
     echo ""
 fi
 
 echo "----------------------------------------------------------"
 log "密码已读入内存，准备部署..."
 
-# 4. 清理旧容器
+# 3. 清理旧容器
 docker rm -f mariadb proxysql adminer >/dev/null 2>&1 || true
 
-# 5. 部署 MariaDB (所有节点)
+# 4. 部署 MariaDB (所有节点)
 log "启动 MariaDB (${MARIADB_IMAGE})..."
+# 注意：使用 host 网络模式
 docker run -d \
     --name mariadb \
     --restart unless-stopped \
@@ -82,7 +83,7 @@ docker run -d \
     --bind-address=0.0.0.0 \
     "${MARIADB_IMAGE}" >/dev/null
 
-# 6. 部署中间件 (仅 Master)
+# 5. 部署中间件 (仅 Master)
 if [ "$MY_ROLE" == "MASTER" ]; then
     log "启动 Adminer (${ADMINER_IMAGE})..."
     docker run -d \
@@ -100,11 +101,4 @@ if [ "$MY_ROLE" == "MASTER" ]; then
         "${PROXYSQL_IMAGE}" >/dev/null
 fi
 
-# 7. 防火墙提示
 log "安装完成！请确保防火墙已放行端口 ${DB_PORT}。"
-if [ "$MY_ROLE" == "MASTER" ]; then
-    echo "   - ProxySQL Admin: ${PROXY_ADMIN_PORT}"
-    echo "   - ProxySQL Query: ${PROXY_QUERY_PORT}"
-    echo "   - Adminer UI:     ${ADMINER_PORT}"
-fi
-echo "=========================================================="
