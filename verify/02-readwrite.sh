@@ -6,7 +6,7 @@ VERIFY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${VERIFY_DIR}/.." && pwd)"
 LIB_DIR="${ROOT_DIR}/bootstrap/lib"
 
-# 2. 加载基础库 (用于日志和直连 Master)
+# 2. 加载基础库
 source "${LIB_DIR}/log.sh"
 source "${LIB_DIR}/mysql.sh"
 
@@ -26,10 +26,15 @@ NC='\033[0m'
 log_info "Starting Read/Write Split Verification..."
 
 # --- Step 1: 准备环境 (使用 Root 在 Master 操作) ---
-# 确保数据库存在，且 app 用户有权限
 log_info "[1/4] Preparing test schema on Master..."
+
+# 修复核心：先创建用户，再授权
+# Master 上创建的用户会自动同步到 Slaves
 mysql_exec_local "mariadb-1" "CREATE DATABASE IF NOT EXISTS ${TEST_DB};"
+mysql_exec_local "mariadb-1" "CREATE USER IF NOT EXISTS '${APP_USER}'@'%' IDENTIFIED BY '${APP_PW}';"
 mysql_exec_local "mariadb-1" "GRANT ALL PRIVILEGES ON ${TEST_DB}.* TO '${APP_USER}'@'%';"
+mysql_exec_local "mariadb-1" "FLUSH PRIVILEGES;"
+
 mysql_exec_local "mariadb-1" "
   CREATE TABLE IF NOT EXISTS ${TEST_DB}.${TEST_TABLE} (
     id INT PRIMARY KEY AUTO_INCREMENT,
@@ -41,9 +46,8 @@ mysql_exec_local "mariadb-1" "
 log_info "[2/4] Testing WRITE traffic via ProxySQL (Port 6033)..."
 log_info "      Sending INSERT requests..."
 
-# 通过 ProxySQL 插入数据，并记录是哪个节点处理了插入操作
+# 通过 ProxySQL 插入数据
 for i in {1..3}; do
-  # 使用 mysql -e 执行插入
   docker exec "${PROXY_CONTAINER}" mysql -u"${APP_USER}" -p"${APP_PW}" -h127.0.0.1 -P6033 -e \
     "INSERT INTO ${TEST_DB}.${TEST_TABLE} (source_node) VALUES (@@hostname);"
 done
@@ -68,18 +72,15 @@ echo "   |-----|--------------|-----------------|---------------|--------|"
 # 循环读取 6 次，观察负载均衡效果
 for i in {1..6}; do
   # 查询 @@hostname 看看请求被路由到了哪里
-  # -Nse: 去头、静默、原始输出
   HANDLER=$(docker exec "${PROXY_CONTAINER}" mysql -u"${APP_USER}" -p"${APP_PW}" -h127.0.0.1 -P6033 -Nse \
     "SELECT @@hostname")
   
   # 判断逻辑
   if [[ "$HANDLER" == "mariadb-1" ]]; then
       ROLE="Master"
-      # 如果读到了 Master，标黄 (可能是 ProxySQL 配置允许读 Master，或者从库延迟)
       STATUS="${YELLOW}Writer${NC}" 
   else
       ROLE="Slave"
-      # 如果读到了 Slave，标绿 (完美的读写分离)
       STATUS="${GREEN}Reader${NC}"
   fi
   
