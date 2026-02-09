@@ -69,23 +69,20 @@ done
 
 log_info "enabling semi-synchronous replication (MariaDB built-in)"
 
-# 尝试加载半同步插件并开启（兼容未在 my.cnf 配置的情况）
-mysql_exec_local "${MASTER}" "
-INSTALL SONAME 'semisync_master';
-SET GLOBAL rpl_semi_sync_master_enabled = 1;
-"
+# 兼容性处理：尝试加载插件，如果失败（如 .so 找不到）则跳过，不中断部署流程
+log_info "attempting to load semisync plugins..."
+mysql_exec_local "${MASTER}" "INSTALL SONAME 'semisync_master';" || log_warn "semisync_master plugin not found, skipping installation"
+mysql_exec_local "${MASTER}" "SET GLOBAL rpl_semi_sync_master_enabled = 1;" || log_warn "failed to set rpl_semi_sync_master_enabled"
 
 for slave in "${SLAVES[@]}"; do
-  mysql_exec_local "${slave}" "
-INSTALL SONAME 'semisync_slave';
-SET GLOBAL rpl_semi_sync_slave_enabled = 1;
-"
+  mysql_exec_local "${slave}" "INSTALL SONAME 'semisync_slave';" || log_warn "semisync_slave plugin not found on ${slave}, skipping installation"
+  mysql_exec_local "${slave}" "SET GLOBAL rpl_semi_sync_slave_enabled = 1;" || log_warn "failed to set rpl_semi_sync_slave_enabled on ${slave}"
 done
 
 log_info "verifying replication status"
 
 for slave in "${SLAVES[@]}"; do
-  # 使用 mysql_query_value 获取具体状态
+  # 验证主从 IO 和 SQL 线程是否正常运行
   IO_RUNNING=$(mysql_query_value "${slave}" "SHOW SLAVE STATUS\G" | grep "Slave_IO_Running:" | awk '{print $2}')
   SQL_RUNNING=$(mysql_query_value "${slave}" "SHOW SLAVE STATUS\G" | grep "Slave_SQL_Running:" | awk '{print $2}')
   
@@ -93,6 +90,7 @@ for slave in "${SLAVES[@]}"; do
     log_info "replication running on ${slave}"
   else
     log_error "replication failure on ${slave}: IO=${IO_RUNNING}, SQL=${SQL_RUNNING}"
+    # 这里保持 exit 1，因为主从同步失败是核心故障，必须拦截
     exit 1
   fi
 done
