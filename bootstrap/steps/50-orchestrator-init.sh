@@ -13,9 +13,10 @@ source "${LIB_DIR}/mysql.sh"
 NETWORK_NAME="mariadb-ha"
 ORC_CONTAINER="orchestrator"
 
-# 核心修正：官方 openark 仓库已废弃且无此 tag。
-# 切换到社区维护的稳定版镜像，解决 pull access denied 问题。
-ORC_IMAGE="hamishforbes/orchestrator:3.2.6"
+# 终极修正：切换到 GitHub 官方容器注册表 (GHCR)
+# 如果此镜像依然拉取失败，脚本会自动尝试 Percona 的镜像作为备选
+ORC_IMAGE_OFFICIAL="ghcr.io/openark/orchestrator:v3.2.6"
+ORC_IMAGE_FALLBACK="perconalab/orchestrator:3.2.6"
 
 # Orchestrator 在 MariaDB 中使用的拓扑探测账号
 ORC_USER="orc_admin"
@@ -33,16 +34,12 @@ for node in "${NODES[@]}"; do
     mysql_exec_local "${node}" "CREATE USER IF NOT EXISTS '${ORC_USER}'@'%' IDENTIFIED BY '${ORC_PW}';"
     
     # 2. 授予核心权限 (MariaDB 兼容)
-    # - SUPER/REPLICATION CLIENT: 发现主从结构
-    # - PROCESS: 查看连接列表
-    # - RELOAD: 允许执行 RESET SLAVE 等操作 (故障切换必需)
     mysql_exec_local "${node}" "GRANT SUPER, PROCESS, REPLICATION SLAVE, REPLICATION CLIENT, RELOAD ON *.* TO '${ORC_USER}'@'%';"
     
     # 3. 授予系统表查询权限
-    # 修复: 移除了 mysql.slave_master_info (MySQL特有)，改为授予 mysql 库只读权限
     mysql_exec_local "${node}" "GRANT SELECT ON mysql.* TO '${ORC_USER}'@'%';"
     
-    # 4. (可选) 如果未来想把 Orchestrator 数据存放在 mariadb-1，预留权限
+    # 4. (可选) 如果未来想把 Orchestrator 数据存放在 mariadb-1
     if [[ "${node}" == "${MASTER}" ]]; then
          mysql_exec_local "${node}" "CREATE DATABASE IF NOT EXISTS orchestrator;"
          mysql_exec_local "${node}" "GRANT ALL PRIVILEGES ON orchestrator.* TO '${ORC_USER}'@'%';"
@@ -57,17 +54,27 @@ if docker ps -a --format '{{.Names}}' | grep -qx "${ORC_CONTAINER}"; then
     docker rm -f "${ORC_CONTAINER}" >/dev/null 2>&1 || true
 fi
 
+# 尝试拉取镜像，具备自动降级机制
+log_info "pulling orchestrator image..."
+if docker pull "${ORC_IMAGE_OFFICIAL}"; then
+    TARGET_IMAGE="${ORC_IMAGE_OFFICIAL}"
+elif docker pull "${ORC_IMAGE_FALLBACK}"; then
+    log_warn "official image failed, falling back to Percona image"
+    TARGET_IMAGE="${ORC_IMAGE_FALLBACK}"
+else
+    log_error "failed to pull both official and fallback orchestrator images. Please check your network."
+    exit 1
+fi
+
 # 启动 Orchestrator
-# 策略：使用内置 SQLite 作为后端存储 (默认配置)，确保启动零依赖、高成功率。
-# 环境变量说明：
-# - ORC_TOPOLOGY_USER/PASSWORD: 告诉 Orchestrator 用什么账号去连接 MariaDB 集群
+# 使用 SQLite 后端 (默认)，无状态启动，最稳健。
 docker run -d \
   --name "${ORC_CONTAINER}" \
   --network "${NETWORK_NAME}" \
   -p 3000:3000 \
   -e ORC_TOPOLOGY_USER="${ORC_USER}" \
   -e ORC_TOPOLOGY_PASSWORD="${ORC_PW}" \
-  "${ORC_IMAGE}" http >/dev/null
+  "${TARGET_IMAGE}" http >/dev/null
 
 log_info "waiting for orchestrator API..."
 
@@ -89,7 +96,6 @@ done
 log_info "triggering discovery of ${MASTER}"
 
 # 触发拓扑发现
-# Orchestrator 会连接 mariadb-1，然后自动顺藤摸瓜发现 mariadb-2 和 3
 docker exec "${ORC_CONTAINER}" orchestrator-client -c discover -i "${MASTER}" || log_warn "discovery trigger returned non-zero, but process might be async"
 
 log_info "orchestrator initialization completed"
