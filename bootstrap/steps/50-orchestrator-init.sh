@@ -12,64 +12,82 @@ source "${LIB_DIR}/mysql.sh"
 
 NETWORK_NAME="mariadb-ha"
 ORC_CONTAINER="orchestrator"
-ORC_IMAGE="openark/orchestrator:3.2.6"
+# 使用官方最新版
+ORC_IMAGE="openark/orchestrator:latest"
 
-# Orchestrator 在 MariaDB 中使用的监控/管理账号
+# Orchestrator 在 MariaDB 中使用的拓扑探测账号
 ORC_USER="orc_admin"
 ORC_PW="orcpass"
 
-# MariaDB 节点列表（用于初始发现）
 MASTER="mariadb-1"
 NODES=("mariadb-1" "mariadb-2" "mariadb-3")
 
 log_info "ensuring orchestrator user exists on all MariaDB nodes"
 
 for node in "${NODES[@]}"; do
-    mysql_exec_local "${node}" "
-    CREATE USER IF NOT EXISTS '${ORC_USER}'@'%' IDENTIFIED BY '${ORC_PW}';
-    GRANT SUPER, PROCESS, REPLICATION SLAVE, REPLICATION CLIENT, RELOAD ON *.* TO '${ORC_USER}'@'%';
-    GRANT SELECT ON mysql.slave_master_info TO '${ORC_USER}'@'%';
-    FLUSH PRIVILEGES;
-    "
+    log_info "configuring permissions on ${node}"
+    
+    # 1. 创建用户
+    mysql_exec_local "${node}" "CREATE USER IF NOT EXISTS '${ORC_USER}'@'%' IDENTIFIED BY '${ORC_PW}';"
+    
+    # 2. 授予核心权限 (MariaDB 兼容)
+    # - SUPER/REPLICATION CLIENT: 发现主从结构
+    # - PROCESS: 查看连接列表
+    # - RELOAD: 允许执行 RESET SLAVE 等操作 (故障切换必需)
+    mysql_exec_local "${node}" "GRANT SUPER, PROCESS, REPLICATION SLAVE, REPLICATION CLIENT, RELOAD ON *.* TO '${ORC_USER}'@'%';"
+    
+    # 3. 授予系统表查询权限
+    # 修复: 移除了 mysql.slave_master_info (MySQL特有)，改为授予 mysql 库只读权限
+    mysql_exec_local "${node}" "GRANT SELECT ON mysql.* TO '${ORC_USER}'@'%';"
+    
+    # 4. (可选) 如果未来想把 Orchestrator 数据存放在 mariadb-1，预留权限
+    if [[ "${node}" == "${MASTER}" ]]; then
+         mysql_exec_local "${node}" "CREATE DATABASE IF NOT EXISTS orchestrator;"
+         mysql_exec_local "${node}" "GRANT ALL PRIVILEGES ON orchestrator.* TO '${ORC_USER}'@'%';"
+    fi
+    
+    mysql_exec_local "${node}" "FLUSH PRIVILEGES;"
 done
 
 log_info "starting orchestrator container: ${ORC_CONTAINER}"
 
-# 注意：Orchestrator 通常需要配置文件或环境变量来指定后端数据库
-# 这里使用环境变量直接连接 mariadb-1 作为 Orchestrator 的后端存储 (Backend DB)
 if docker ps -a --format '{{.Names}}' | grep -qx "${ORC_CONTAINER}"; then
-    log_info "container already exists, restarting: ${ORC_CONTAINER}"
-    docker stop "${ORC_CONTAINER}" >/dev/null 2>&1 || true
-    docker rm "${ORC_CONTAINER}" >/dev/null 2>&1 || true
+    docker rm -f "${ORC_CONTAINER}" >/dev/null 2>&1 || true
 fi
 
 # 启动 Orchestrator
-# ORC_TOPOLOGY_USER/PASS 用于探测拓扑
-# ORC_DB_USER/PASS 用于连接它自己的元数据库 (这里复用 mariadb-1)
+# 策略：使用内置 SQLite 作为后端存储 (默认配置)，确保启动零依赖、高成功率。
+# 环境变量说明：
+# - ORC_TOPOLOGY_USER/PASSWORD: 告诉 Orchestrator 用什么账号去连接 MariaDB 集群
 docker run -d \
   --name "${ORC_CONTAINER}" \
   --network "${NETWORK_NAME}" \
-  -e ORC_DB_NAME="orchestrator" \
-  -e ORC_USER="${ORC_USER}" \
-  -e ORC_PASSWORD="${ORC_PW}" \
-  -e ORC_DB_HOST="mariadb-1" \
+  -p 3000:3000 \
   -e ORC_TOPOLOGY_USER="${ORC_USER}" \
   -e ORC_TOPOLOGY_PASSWORD="${ORC_PW}" \
-  -p 3000:3000 \
-  "${ORC_IMAGE}" >/dev/null
+  "${ORC_IMAGE}" http >/dev/null
 
-log_info "waiting for orchestrator API to be ready..."
+log_info "waiting for orchestrator API..."
 
+# 健康检查循环
 for i in {1..30}; do
-    if curl -s "http://localhost:3000/api/health" | grep -q "OK" >/dev/null 2>&1; then
+    if curl -s "http://localhost:3000/api/health" | grep -q "OK"; then
+        log_info "orchestrator is up"
         break
+    fi
+    
+    if [ $i -eq 30 ]; then
+        log_error "orchestrator failed to start within 60s"
+        docker logs --tail 20 "${ORC_CONTAINER}"
+        exit 1
     fi
     sleep 2
 done
 
-log_info "discovering initial topology via ${MASTER}"
+log_info "triggering discovery of ${MASTER}"
 
-# 让 Orchestrator 开始扫描整个集群
-docker exec "${ORC_CONTAINER}" orchestrator-client -c discover -i "${MASTER}:3306" || true
+# 触发拓扑发现
+# Orchestrator 会连接 mariadb-1，然后自动顺藤摸瓜发现 mariadb-2 和 3
+docker exec "${ORC_CONTAINER}" orchestrator-client -c discover -i "${MASTER}" || log_warn "discovery trigger returned non-zero, but process might be async"
 
 log_info "orchestrator initialization completed"

@@ -4,7 +4,7 @@ set -euo pipefail
 ###############################################################################
 # bootstrap/entrypoint.sh
 # 职责：按顺序执行 steps 目录下的所有初始化脚本，并严格监控返回码。
-# 改进：强制子脚本执行环境，确保错误不再被隐式忽略。
+# 改进：使用 set +e 显式捕获退出码，避免 '!' 逻辑取反导致错误码丢失 (变为0)。
 ###############################################################################
 
 BOOTSTRAP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,10 +51,15 @@ for step in "${STEPS[@]}"; do
   fi
 
   # 核心改动：
-  # 1. 使用 bash -e 强制子脚本在遇到任何未捕获错误时立即退出
-  # 2. if ! 判断能够捕获该 bash 进程的非零退出码
-  if ! bash -e "${step}"; then
-    status=$?
+  # 使用 set +e 暂时关闭自动退出，以便精准捕获子脚本的原始退出码。
+  # 之前的 'if ! cmd' 写法会导致 $? 被 '!' 逻辑取反为 0，从而丢失真实错误码。
+  set +e
+  bash -e "${step}"
+  status=$?
+  set -e
+
+  # 检查退出码
+  if [ "${status}" -ne 0 ]; then
     log_error "step failed with exit code ${status}: ${step_name}"
     # 立即终止整个 bootstrap 过程，并将错误码回传给 install.sh
     exit "${status}"
