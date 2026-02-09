@@ -12,8 +12,8 @@ source "${LIB_DIR}/mysql.sh"
 
 NETWORK_NAME="mariadb-ha"
 ORC_CONTAINER="orchestrator"
-# 使用官方最新版
-ORC_IMAGE="openark/orchestrator:latest"
+# 修正：使用具体版本号，官方仓库没有 latest 标签
+ORC_IMAGE="openark/orchestrator:3.2.6"
 
 # Orchestrator 在 MariaDB 中使用的拓扑探测账号
 ORC_USER="orc_admin"
