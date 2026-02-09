@@ -20,7 +20,7 @@ echo -e "${BLUE}>>> 开始下载安装包...${NC}"
 mkdir -p "${INSTALL_DIR}"
 cd "${INSTALL_DIR}"
 
-# 2. 下载并解压 (覆盖模式)
+# 2. 下载并解压
 curl -L -s "${REPO_URL}" | tar xz --strip-components=1
 
 # 3. 赋予执行权限
@@ -30,31 +30,28 @@ echo -e "${GREEN}>>> 下载完成！${NC}"
 echo "========================================================"
 echo "   欢迎使用 MariaDB 高可用集群 (v2.0 分布式版) 安装向导"
 echo "========================================================"
-echo "请准备好 3 台服务器的内网 IP 地址。"
+echo "请准备好 3 台服务器的内网/公网 IP 地址。"
 echo "本机将被自动识别并安装对应的角色 (Master 或 Slave)。"
 echo "--------------------------------------------------------"
 
-# 4. 交互式生成配置文件 (如果不存在)
+# 4. 交互式生成配置文件
 CONF_FILE="topology.env"
 
-if [ -f "${CONF_FILE}" ]; then
-    echo -e "${BLUE}检测到配置文件已存在，跳过配置步骤。${NC}"
-    echo "如果是配置错误，请删除 ${INSTALL_DIR}/${CONF_FILE} 后重试。"
-else
-    echo -e "${BLUE}>>> 请配置集群拓扑 (请输入真实 IP):${NC}"
-    
-    # 交互输入 IP
-    read -p "1. 请输入 主节点 (Node-1) IP: " NODE_1
-    while [[ -z "$NODE_1" ]]; do read -p "   IP不能为空，请重新输入: " NODE_1; done
+# 逻辑：只要是从远程 curl 安装，我们就强制重新生成配置，防止旧配置干扰
+echo -e "${BLUE}>>> 请配置集群拓扑 (请输入真实 IP):${NC}"
 
-    read -p "2. 请输入 从节点 (Node-2) IP: " NODE_2
-    while [[ -z "$NODE_2" ]]; do read -p "   IP不能为空，请重新输入: " NODE_2; done
+# [关键修复] 使用 < /dev/tty 强制从终端读取用户输入，兼容 curl | bash
+read -p "1. 请输入 主节点 (Node-1) IP: " NODE_1 < /dev/tty
+while [[ -z "$NODE_1" ]]; do read -p "   IP不能为空，请重新输入: " NODE_1 < /dev/tty; done
 
-    read -p "3. 请输入 从节点 (Node-3) IP: " NODE_3
-    while [[ -z "$NODE_3" ]]; do read -p "   IP不能为空，请重新输入: " NODE_3; done
+read -p "2. 请输入 从节点 (Node-2) IP: " NODE_2 < /dev/tty
+while [[ -z "$NODE_2" ]]; do read -p "   IP不能为空，请重新输入: " NODE_2 < /dev/tty; done
 
-    # 写入文件
-    cat <<EOC > "${CONF_FILE}"
+read -p "3. 请输入 从节点 (Node-3) IP: " NODE_3 < /dev/tty
+while [[ -z "$NODE_3" ]]; do read -p "   IP不能为空，请重新输入: " NODE_3 < /dev/tty; done
+
+# 写入文件
+cat <<EOC > "${CONF_FILE}"
 # 自动生成的拓扑配置
 NODE_1_IP="${NODE_1}"
 NODE_2_IP="${NODE_2}"
@@ -75,13 +72,11 @@ ADMINER_IMAGE="adminer:latest"
 REPL_USER="repl_user"
 APP_USER="app"
 EOC
-    echo -e "${GREEN}>>> 配置已保存至 ${CONF_FILE}${NC}"
-fi
 
+echo -e "${GREEN}>>> 配置已保存至 ${CONF_FILE}${NC}"
 echo ""
-echo -e "${BLUE}>>> 准备开始安装...${NC}"
-echo "即将执行本地安装脚本..."
-sleep 2
 
 # 5. 调用核心安装脚本
+echo -e "${BLUE}>>> 准备开始安装...${NC}"
+sleep 1
 ./install_node.sh
