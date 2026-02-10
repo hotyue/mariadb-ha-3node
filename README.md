@@ -101,11 +101,11 @@
 
 - 不改变原有执行顺序或失败语义
 
-### 2. 远程一行命令部署（v1.1.2）
+### 2. 远程一行命令部署（v3.0.0）
 
-无需 clone 仓库，直接执行：
+无需 clone 仓库，直接执行稳定版一键安装 ：
 ```bansh
-curl -fsSL https://raw.githubusercontent.com/hotyue/mariadb-ha-3node/main/install-remote.sh | bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/hotyue/mariadb-ha-3node/main/scripts/bootstrap.sh)"
 ```
 
 事实说明：
