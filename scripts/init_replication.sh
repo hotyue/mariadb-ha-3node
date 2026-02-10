@@ -2,11 +2,10 @@
 set -euo pipefail
 
 # ==============================================================================
-# MariaDB HA v3.2 - Replication Setup (Hex-Encoded Safe Mode)
+# MariaDB HA v3.2 - Replication Setup (Escaped String Mode)
 # ==============================================================================
-# 修复 1: 使用 MYSQL_PWD 环境变量连接数据库 (Root 密码安全)
-# 修复 2: 使用 Hex 编码处理复制密码 (Repl 密码安全，支持 ', ", \, #)
-# 修复 3: 适配 MariaDB 11+ 客户端指令
+# 修复: 解决 CHANGE MASTER 不支持 Hex (X'...') 语法的问题
+# 方案: 使用 Bash 字符串替换进行转义，支持特殊字符 (', \, #)
 # ==============================================================================
 
 # 0. 加载配置
@@ -28,7 +27,7 @@ warn() { echo -e "${RED}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # ==============================================================================
-# 1. 身份识别 (兼容 NAT 环境)
+# 1. 身份识别
 # ==============================================================================
 LOCAL_IPS=$(hostname -I)
 MY_ROLE="UNKNOWN"
@@ -44,8 +43,6 @@ fi
 if [ "$MY_ROLE" == "UNKNOWN" ]; then
     echo "----------------------------------------------------------"
     warn "无法通过内网 IP ($LOCAL_IPS) 自动识别本机角色。"
-    echo "检测到可能处于公有云 NAT 环境。"
-    echo ""
     echo "请手动选择本机身份:"
     echo " 1) Master (Node-1: $NODE_1_IP)"
     echo " 2) Slave  (Node-2: $NODE_2_IP)"
@@ -74,7 +71,7 @@ echo "=========================================================="
 # ==============================================================================
 echo ">>> 请输入密码以配置复制 (输入不显示)"
 
-# [修复] 使用 -r 防止反斜杠被转义
+# 使用 -r 防止反斜杠被转义
 read -r -s -p "1. 输入 Root 密码: " ROOT_PASS < /dev/tty
 echo ""
 if [ -z "$ROOT_PASS" ]; then err "密码不能为空"; fi
@@ -87,14 +84,19 @@ if [ -z "$REPL_PASS" ]; then err "密码不能为空"; fi
 # 辅助函数
 # ==============================================================================
 
-# 函数：执行 SQL (使用 MYSQL_PWD 环境变量，防止 Root 密码包含特殊字符出错)
+# 执行 SQL (使用 MYSQL_PWD 环境变量)
 exec_sql() {
     docker exec -i -e MYSQL_PWD="${ROOT_PASS}" mariadb mariadb -uroot -e "$1"
 }
 
-# 函数：字符串转 Hex (用于安全传递 REPL 密码)
-str_to_hex() {
-    printf "%s" "$1" | od -An -tx1 | tr -d ' \n'
+# [关键修复] SQL 转义函数
+# 1. 将反斜杠 \ 替换为 \\ (必须先做)
+# 2. 将单引号 ' 替换为 \'
+escape_sql_str() {
+    local input="$1"
+    local output="${input//\\/\\\\}"
+    output="${output//\'/\\\'}"
+    echo "$output"
 }
 
 # ==============================================================================
@@ -103,13 +105,11 @@ str_to_hex() {
 if [ "${MY_ROLE}" == "MASTER" ]; then
     log "[Master] 创建复制用户 '${REPL_USER}'..."
     
-    # 这里的 REPL_PASS 如果包含单引号会破坏 SQL，虽然概率小，但最好也用 Hex
-    # 不过创建用户的语法 IDENTIFIED BY 比较宽容，我们用标准方式即可，
-    # 只要 ROOT_PASS 是安全的(已通过 MYSQL_PWD 解决)，这里通常没问题。
-    # 为了极致安全，这里也用 Hex 注入密码是不错的选择，但 CREATE USER 语法稍有不同。
-    # 这里我们保持简单，因为 REPL 密码通常由运维控制，不像 Root 那么随意。
-    
-    exec_sql "CREATE USER IF NOT EXISTS '${REPL_USER}'@'%' IDENTIFIED BY '${REPL_PASS}';"
+    # 对密码进行转义处理，防止 SQL 注入或语法错误
+    SAFE_REPL_PASS=$(escape_sql_str "${REPL_PASS}")
+
+    # 使用标准 SQL 语法创建用户
+    exec_sql "CREATE USER IF NOT EXISTS '${REPL_USER}'@'%' IDENTIFIED BY '${SAFE_REPL_PASS}';"
     exec_sql "GRANT REPLICATION SLAVE ON *.* TO '${REPL_USER}'@'%';"
     exec_sql "FLUSH PRIVILEGES;"
     
@@ -121,21 +121,27 @@ if [ "${MY_ROLE}" == "MASTER" ]; then
 else
     log "[Slave] 正在连接 Master (${NODE_1_IP})..."
     
-    # 1. 停止同步
+    # 1. 停止同步 (防止报错)
     exec_sql "STOP SLAVE; RESET SLAVE ALL;" || true
     
-    # 2. 准备复制密码的 Hex 形式 (核心修复: 解决 CHANGE MASTER 语法错误)
-    REPL_PASS_HEX=$(str_to_hex "${REPL_PASS}")
+    # 2. 对密码进行转义处理 (修复 'X' Hex 语法错误)
+    SAFE_REPL_PASS=$(escape_sql_str "${REPL_PASS}")
     
     # 3. 配置 GTID 复制
-    # 使用 MASTER_PASSWORD=X'...' 语法，绝对安全
-    exec_sql "CHANGE MASTER TO \
+    # 这里使用标准的单引号包裹密码，因为内部已转义，所以支持包含单引号或反斜杠的密码
+    # 注意: SQL_CMD 变量构建时，Bash 会展开变量，但不会二次转义
+    
+    SQL_CMD="CHANGE MASTER TO \
         MASTER_HOST='${NODE_1_IP}', \
         MASTER_PORT=${DB_PORT}, \
         MASTER_USER='${REPL_USER}', \
-        MASTER_PASSWORD=X'${REPL_PASS_HEX}', \
+        MASTER_PASSWORD='${SAFE_REPL_PASS}', \
         MASTER_USE_GTID=slave_pos;"
-        
+    
+    # 调试输出 (隐藏密码)
+    # echo "DEBUG SQL: ${SQL_CMD}" | sed "s/MASTER_PASSWORD='.*'/MASTER_PASSWORD='******'/g"
+
+    exec_sql "${SQL_CMD}"
     exec_sql "START SLAVE;"
     
     log "[Slave] 复制已启动，正在检查状态..."
