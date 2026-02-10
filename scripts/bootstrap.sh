@@ -10,7 +10,7 @@ set -e
 # ==============================================================================
 
 # 配置
-BRANCH="dev-v3"
+BRANCH="main"
 REPO="mariadb-ha-3node"
 DOWNLOAD_URL="https://github.com/hotyue/$REPO/archive/refs/heads/$BRANCH.tar.gz"
 
