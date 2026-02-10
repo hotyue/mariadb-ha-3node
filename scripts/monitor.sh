@@ -2,11 +2,11 @@
 set -u
 
 # ==============================================================================
-# MariaDB HA v3.2 - Auto Monitor (EnvVar Injection)
+# MariaDB HA v3.2 - Auto Monitor (EnvVar Injection & MariaDB 11 Ready)
 # ==============================================================================
 # 依赖: 必须先运行 scripts/save_secrets.sh 生成 .secrets.env
-# Fix 1: 使用 MYSQL_PWD 环境变量传递密码，彻底支持特殊字符 (*, #, @, !)
-# Fix 2: 兼容性健康检查 (mariadb-admin / mysqladmin / SQL)
+# Fix 1: 使用 MYSQL_PWD 环境变量传递密码，完美支持 (*, #, @, !, \, ', ")
+# Fix 2: 适配 MariaDB 11+ (优先使用 mariadb-admin)
 # ==============================================================================
 
 # 1. 基础配置
@@ -56,17 +56,23 @@ log ">>> 本机角色: $MY_ROLE"
 # ==============================================================================
 check_master_health() {
     local target_ip=$1
-    # 方法 A: 尝试 mariadb-admin (新版容器标准工具)
+    # 这里的 monitor 用户密码通常较简单，且在 init 脚本中固定。
+    # 如果你也修改了 monitor 用户的密码为复杂密码，这里也需要用 MYSQL_PWD。
+    # 但按照标准流程，monitor_pass 是固定的简单密码，使用 -p 暂无风险。
+    # 为了极致稳健，我们尝试多种工具。
+    
+    # 方法 A: 尝试 mariadb-admin (MariaDB 11+ 标准工具)
     if docker exec mariadb mariadb-admin -h "$target_ip" -u monitor -pmonitor_pass ping --connect-timeout=3 >/dev/null 2>&1; then
         return 0
     fi
     
-    # 方法 B: 尝试 mysqladmin (旧版容器兼容)
+    # 方法 B: 尝试 mysqladmin (旧版兼容)
     if docker exec mariadb mysqladmin -h "$target_ip" -u monitor -pmonitor_pass ping --connect-timeout=3 >/dev/null 2>&1; then
         return 0
     fi
     
     # 方法 C: 尝试 SQL 简单查询 (最底层兜底，只要能连上就算活)
+    # 只要能执行 SQL，说明 mysqld 进程是活的
     if docker exec mariadb mariadb -h "$target_ip" -u monitor -pmonitor_pass -e "DO 1;" --connect-timeout=3 >/dev/null 2>&1; then
         return 0
     fi
@@ -76,7 +82,7 @@ check_master_health() {
 }
 
 # ==============================================================================
-# 核心函数 (使用环境变量注入密码)
+# 核心函数 (使用环境变量注入密码 - 核心修复)
 # ==============================================================================
 
 promote_db_to_master() {
@@ -99,7 +105,8 @@ switch_proxysql_routing() {
     log ">>> [ProxySQL Action] 将写流量 (HG 10) 切换至: $new_writer_ip"
 
     # [FIX] 使用 -e MYSQL_PWD 传递 Admin 密码
-    # 这里是处理特殊字符最关键的地方
+    # 这是处理特殊字符最关键的地方。MYSQL_PWD 环境变量会被 mysql 客户端直接读取，
+    # 绕过了 Shell 的参数解析层，因此支持 #, *, ', " 等任意字符。
     docker exec -e MYSQL_PWD="$AUTO_PROXY_ADMIN_PASS" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL >> "$LOG_FILE" 2>&1
         -- 1. 删除旧的 Writer
         DELETE FROM mysql_servers WHERE hostgroup_id=10;
@@ -112,11 +119,12 @@ switch_proxysql_routing() {
         SAVE MYSQL SERVERS TO DISK;
 SQL
     
-    # 增加简单的退出码检查
+    # 检查退出码
     if [ $? -eq 0 ]; then
         log ">>> [Success] 本地 ProxySQL 路由已更新。"
     else
         log ">>> [Error] ProxySQL 更新失败 (Access Denied 或 容器未运行)。"
+        log ">>> 请检查 .secrets.env 中的密码是否与 ProxySQL 实际密码一致。"
     fi
 }
 
@@ -143,15 +151,17 @@ while true; do
             log "!!! [CRITICAL] 判定 Master (Node-1) 已宕机 !!!"
             log "!!! 启动故障转移程序 !!!"
             
-            # 1. 数据库层切换 (仅 Node-2)
+            # 1. 数据库层切换 (仅 Node-2 执行，避免 Node-2 和 Node-3 同时抢主)
             if [ "$MY_ROLE" == "NODE_2" ]; then
                 promote_db_to_master
             fi
 
-            # 2. 路由层切换 (Node-2 & Node-3)
+            # 2. 路由层切换 (Node-2 & Node-3 都要执行，因为每个节点都有 ProxySQL)
             switch_proxysql_routing "$NODE_2_IP"
 
             log ">>> 故障转移完成。Writer 已指向 Node-2 ($NODE_2_IP)。"
+            
+            # 故障转移是一次性的，完成后退出脚本，等待人工介入修复原 Master
             exit 0
         fi
     fi

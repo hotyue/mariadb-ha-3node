@@ -2,13 +2,13 @@
 set -e
 
 # ==============================================================================
-# MariaDB HA v3.2 - Secret Manager (Special Char Hardened)
+# MariaDB HA v3.2 - Secret Manager (Single-Quote Safe Mode)
 # ==============================================================================
 # 作用: 生成 .secrets.env 文件，供全自动 Monitor 脚本读取密码
 # 安全性: 
 #   1. 生成的文件权限强制为 600 (仅 root 可读写)
-#   2. 使用单引号强引用，支持 *, #, @, $, %, \ 等特殊字符
-#   3. 使用 read -r 防止输入时反斜杠转义
+#   2. 使用单引号强引用，完美支持 *, #, @, $, %, \ 等特殊字符
+#   3. 自动转义密码中的单引号 (')，防止 breaking env file
 # ==============================================================================
 
 # 基础目录
@@ -28,12 +28,16 @@ echo "此脚本将生成 .secrets.env 文件，用于全自动故障转移。"
 echo "请确保您输入的是正确的安装密码。"
 echo ""
 
-# 1. 获取 DB Root 密码 (使用 -r 防止反斜杠转义)
+# ------------------------------------------------------------------------------
+# 1. 获取 DB Root 密码
+# ------------------------------------------------------------------------------
 while true; do
-    read -r -s -p "请输入 DB Root 密码: " DB_ROOT_1
+    # 使用 -r 防止反斜杠被转义，从 tty 读取确保交互正常
+    read -r -s -p "请输入 DB Root 密码: " DB_ROOT_1 < /dev/tty
     echo ""
-    read -r -s -p "请再次输入 DB Root 密码: " DB_ROOT_2
+    read -r -s -p "请再次输入 DB Root 密码: " DB_ROOT_2 < /dev/tty
     echo ""
+    
     if [ "$DB_ROOT_1" == "$DB_ROOT_2" ] && [ -n "$DB_ROOT_1" ]; then
         DB_ROOT_PASS="$DB_ROOT_1"
         break
@@ -42,13 +46,16 @@ while true; do
     fi
 done
 
-# 2. 获取 ProxySQL Admin 密码 (使用 -r 防止反斜杠转义)
+# ------------------------------------------------------------------------------
+# 2. 获取 ProxySQL Admin 密码
+# ------------------------------------------------------------------------------
 echo ""
 while true; do
-    read -r -s -p "请输入 ProxySQL Admin 密码: " PROXY_ADMIN_1
+    read -r -s -p "请输入 ProxySQL Admin 密码: " PROXY_ADMIN_1 < /dev/tty
     echo ""
-    read -r -s -p "请再次输入 ProxySQL Admin 密码: " PROXY_ADMIN_2
+    read -r -s -p "请再次输入 ProxySQL Admin 密码: " PROXY_ADMIN_2 < /dev/tty
     echo ""
+    
     if [ "$PROXY_ADMIN_1" == "$PROXY_ADMIN_2" ] && [ -n "$PROXY_ADMIN_1" ]; then
         PROXY_ADMIN_PASS="$PROXY_ADMIN_1"
         break
@@ -57,24 +64,34 @@ while true; do
     fi
 done
 
-# 3. 写入文件
+# ------------------------------------------------------------------------------
+# 3. 数据清洗 (单引号转义) - 关键修复
+# ------------------------------------------------------------------------------
+# 如果密码包含单引号 '，直接写入 '...' 会导致 env 文件语法错误。
+# Bash 中将 ' 替换为 '\'' 即可在单引号字符串中包含单引号。
+SAFE_DB_ROOT_PASS="${DB_ROOT_PASS//\'/\'\\\'\'}"
+SAFE_PROXY_ADMIN_PASS="${PROXY_ADMIN_PASS//\'/\'\\\'\'}"
+
+# ------------------------------------------------------------------------------
+# 4. 写入文件
+# ------------------------------------------------------------------------------
 echo -e "\n${BLUE}正在生成凭据文件...${NC}"
 
-# 注意：这里使用不带引号的 SECRET 标识符，允许变量展开
-# 但在变量外部加上单引号 ''，确保写入文件后是强引用格式
-# 这样处理后，即使密码里有 # (井号)，source 时也不会被当做注释
 cat <<SECRET > "$SECRET_FILE"
 # ========================================================
 # MariaDB HA Automation Secrets
 # Generated at: $(date)
 # WARNING: DO NOT COMMIT THIS FILE TO GIT!
 # ========================================================
-# 使用单引号包裹，防止 Shell 解析特殊字符 (*, $, @, # 等)
-export AUTO_DB_ROOT_PASS='${DB_ROOT_PASS}'
-export AUTO_PROXY_ADMIN_PASS='${PROXY_ADMIN_PASS}'
+# 采用单引号强引用，即便是 #, $, \, ! 也能被原样读取
+# 同时也处理了内部单引号的转义问题
+export AUTO_DB_ROOT_PASS='${SAFE_DB_ROOT_PASS}'
+export AUTO_PROXY_ADMIN_PASS='${SAFE_PROXY_ADMIN_PASS}'
 SECRET
 
-# 4. 设置安全权限 (关键步骤)
+# ------------------------------------------------------------------------------
+# 5. 设置权限
+# ------------------------------------------------------------------------------
 chmod 600 "$SECRET_FILE"
 
 if [ -f "$SECRET_FILE" ]; then
