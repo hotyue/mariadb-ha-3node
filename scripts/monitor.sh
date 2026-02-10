@@ -2,10 +2,11 @@
 set -u
 
 # ==============================================================================
-# MariaDB HA v3.0 - Auto Monitor & Failover (Special Char Fix)
+# MariaDB HA v3.0 - Auto Monitor & Failover (Sentinel)
 # ==============================================================================
 # 依赖: 必须先运行 scripts/save_secrets.sh 生成 .secrets.env
-# 修复: 针对密码变量增加双引号 "$VAR" 包裹，防止 Shell 解析特殊字符
+# Fix 1: 针对密码变量增加双引号 "$VAR" 包裹，防止 Shell 解析特殊字符
+# Fix 2: 替换 mysqladmin 为 mariadb-admin (适配新版容器)，增加 SQL 连接兜底
 # ==============================================================================
 
 # 1. 基础配置
@@ -46,9 +47,34 @@ if [[ "$LOCAL_IPS" == *"$NODE_1_IP"* ]]; then MY_ROLE="NODE_1"; fi
 if [[ "$LOCAL_IPS" == *"$NODE_2_IP"* ]]; then MY_ROLE="NODE_2"; fi
 if [[ "$LOCAL_IPS" == *"$NODE_3_IP"* ]]; then MY_ROLE="NODE_3"; fi
 
-log ">>> 哨兵启动 (Monitor v3.0-Fix)"
+log ">>> 哨兵启动 (Monitor v3.1-Stable)"
 log ">>> 监控目标: Node-1 ($NODE_1_IP)"
 log ">>> 本机角色: $MY_ROLE"
+
+# ==============================================================================
+# 辅助函数: 健康检查 (兼容性增强)
+# ==============================================================================
+check_master_health() {
+    local target_ip=$1
+    # 方法 A: 尝试 mariadb-admin (新版容器标准工具)
+    if docker exec mariadb mariadb-admin -h "$target_ip" -u monitor -pmonitor_pass ping --connect-timeout=3 >/dev/null 2>&1; then
+        return 0
+    fi
+    
+    # 方法 B: 尝试 mysqladmin (旧版容器兼容)
+    if docker exec mariadb mysqladmin -h "$target_ip" -u monitor -pmonitor_pass ping --connect-timeout=3 >/dev/null 2>&1; then
+        return 0
+    fi
+    
+    # 方法 C: 尝试 SQL 简单查询 (最底层兜底，只要能连上就算活)
+    # DO 1; 是开销最小的 SQL 语句
+    if docker exec mariadb mariadb -h "$target_ip" -u monitor -pmonitor_pass -e "DO 1;" --connect-timeout=3 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # 全部失败，判定为挂了
+    return 1
+}
 
 # ==============================================================================
 # 核心函数 (已加固密码引用)
@@ -94,9 +120,8 @@ SQL
 while true; do
     if [ "$MY_ROLE" == "NODE_1" ]; then sleep 60; continue; fi
 
-    # 检测 Master (使用 monitor 用户，密码固定为 monitor_pass)
-    # 如果 monitor_pass 也有特殊字符，这里也需要加引号，但脚本里它是硬编码的字符串
-    if docker exec mariadb mysqladmin -h "$NODE_1_IP" -u monitor -pmonitor_pass ping --connect-timeout=3 >/dev/null 2>&1; then
+    # 调用兼容性检测函数，不再直接依赖 mysqladmin
+    if check_master_health "$NODE_1_IP"; then
         # === Master 活着 ===
         if [ $FAIL_COUNT -gt 0 ]; then
             log "Master ($NODE_1_IP) 恢复正常。"
