@@ -20,14 +20,18 @@ NC='\033[0m'
 
 log() { echo -e "${BLUE}[INFO]${NC} $1"; }
 
-# 2. 交互式获取密码 (如果环境变量里没有)
+# 2. 交互式获取密码 (防止环境变量为空导致的 Access Denied)
 echo "----------------------------------------------------------"
-echo ">>> ProxySQL 初始化配置"
+echo ">>> ProxySQL 初始化配置 (请输入安装时设置的密码)"
 echo "----------------------------------------------------------"
+
+# 强制询问 DB Root 密码
 if [ -z "$DB_ROOT_PASS" ]; then
     read -s -p "1. 请输入 DB Root 密码: " DB_ROOT_PASS
     echo ""
 fi
+
+# 强制询问 ProxySQL Admin 密码
 if [ -z "$PROXY_ADMIN_PASS" ]; then
     read -s -p "2. 请输入 ProxySQL Admin 密码: " PROXY_ADMIN_PASS
     echo ""
@@ -49,7 +53,7 @@ if [ "$AM_I_MASTER" -eq 1 ]; then
     log "本机是 Master，正在创建后端数据库账号 (monitor & app)..."
     
     # 尝试创建 monitor 用户 (用于 ProxySQL 心跳检测)
-    # 注意：这里使用 IGNORE 或 IF NOT EXISTS 防止重复报错
+    # 使用 IGNORE 或 IF NOT EXISTS 防止重复报错
     docker exec -i mariadb mariadb -uroot -p"${DB_ROOT_PASS}" <<-SQL
         -- 创建监控用户
         CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor_pass';
