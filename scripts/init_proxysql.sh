@@ -2,16 +2,18 @@
 set -euo pipefail
 
 # ==============================================================================
-# MariaDB HA v3.2 - ProxySQL Initialization (Hex-CAST Ultimate Mode)
+# MariaDB HA v3.2 - ProxySQL Initialization (Standard Escaped Mode)
 # ==============================================================================
-# 终极修复: 解决带 '#' 号密码被截断 及 Hex 存入变为 Blob 的双重问题
-# 方案: 使用 Hex 传输数据 (避开Shell解析)，并在 SQL 层 CAST 为 TEXT (适配SQLite)
+# 修复方案: 回归标准 SQL 字符串语法 ('...')
+# 核心机制: 
+#   1. Bash 层面转义密码中的 ' 和 \ 
+#   2. SQL 层面用单引号包裹完整凭据，确保 # 号被视为字符串内容而非注释
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${BASE_DIR}/topology.env"
 
-# 颜色定义
+# 颜色
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 RED='\033[0;31m'
@@ -22,7 +24,7 @@ warn() { echo -e "${RED}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 echo "----------------------------------------------------------"
-echo ">>> ProxySQL 初始化配置 (v3.2 Hex-CAST 终极版)"
+echo ">>> ProxySQL 初始化配置 (v3.2 标准转义版)"
 echo "----------------------------------------------------------"
 
 # 1. 获取密码
@@ -37,14 +39,7 @@ fi
 echo "----------------------------------------------------------"
 
 # ==============================================================================
-# 辅助函数: 字符串转 Hex
-# ==============================================================================
-str_to_hex() {
-    printf "%s" "$1" | od -An -tx1 | tr -d ' \n'
-}
-
-# ==============================================================================
-# 2. 后端账号创建 (MariaDB 11 兼容)
+# 2. 后端账号创建
 # ==============================================================================
 LOCAL_IPS=$(hostname -I)
 if [[ "$LOCAL_IPS" == *"$NODE_1_IP"* ]]; then
@@ -62,7 +57,7 @@ else
 fi
 
 # ==============================================================================
-# 3. 智能探测 ProxySQL 连接
+# 3. 智能探测与重置检查
 # ==============================================================================
 log "正在探测 ProxySQL 连接状态..."
 
@@ -76,59 +71,60 @@ check_proxysql() {
     fi
 }
 
-# 探测逻辑
 if check_proxysql "${PROXY_ADMIN_PASS}"; then
     CURRENT_PASS="${PROXY_ADMIN_PASS}"
     log "连接成功 (使用自定义密码)。"
 elif check_proxysql "admin"; then
     CURRENT_PASS="admin"
-    warn "ProxySQL 正在使用默认密码 (admin)。准备进行安全加固..."
+    warn "ProxySQL 正在使用默认密码 (admin)。"
 else
-    warn "无法连接 ProxySQL (既不是新密码也不是 admin)。"
-    err "环境状态异常，请先重置容器: docker rm -f proxysql && ./install_node.sh"
+    warn "无法连接 ProxySQL！"
+    err "环境状态异常，请务必先重置容器: docker rm -f proxysql && ./install_node.sh"
 fi
 
 # ==============================================================================
-# 4. 下发配置 (Hex-CAST 核心逻辑)
+# 辅助函数: SQL 字符串转义 (核心修复)
+# ==============================================================================
+escape_sql_str() {
+    local input="$1"
+    local output="${input//\\/\\\\}" # 先转义反斜杠
+    output="${output//\'/\\\'}"     # 再转义单引号
+    echo "$output"
+}
+
+# ==============================================================================
+# 4. 下发配置
 # ==============================================================================
 log "正在下发路由配置与权限..."
 
-# 计算 Admin 凭据的 Hex 值 (格式: admin:password)
-ADMIN_CRED_STR="admin:${PROXY_ADMIN_PASS}"
-ADMIN_CRED_HEX=$(str_to_hex "${ADMIN_CRED_STR}")
-
-log "生成的凭据 Hex 签名: ${ADMIN_CRED_HEX:0:10}..."
+# 转义密码
+SAFE_ADMIN_PASS=$(escape_sql_str "${PROXY_ADMIN_PASS}")
 
 # 构建 SQL
-# 关键点: 使用 CAST(X'...' AS TEXT) 确保 SQLite 存入的是文本
+# 重点: 在 SQL 中，'admin:...' 是被单引号包裹的，所以 # 号是安全的，不会被当做注释
 docker exec -i -e MYSQL_PWD="${CURRENT_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL
-    -- 清理旧配置
     DELETE FROM mysql_servers;
     DELETE FROM mysql_users;
     DELETE FROM mysql_query_rules;
 
-    -- 添加服务器
     INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (10, '$NODE_1_IP', 3306);
     INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (20, '$NODE_1_IP', 3306);
     INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (20, '$NODE_2_IP', 3306);
     INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (20, '$NODE_3_IP', 3306);
 
-    -- 添加用户
     UPDATE global_variables SET variable_value='monitor' WHERE variable_name='mysql-monitor_username';
     UPDATE global_variables SET variable_value='monitor_pass' WHERE variable_name='mysql-monitor_password';
     UPDATE global_variables SET variable_value='2000' WHERE variable_name='mysql-monitor_connect_interval';
     
     INSERT INTO mysql_users (username, password, default_hostgroup) VALUES ('app', 'app_pass', 10);
 
-    -- 路由规则
     INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup, apply) VALUES (1, 1, '^SELECT.*FOR UPDATE$', 10, 1);
     INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup, apply) VALUES (2, 1, '^SELECT', 20, 1);
     
-    -- [核心修复] 更新 Admin 密码
-    -- 使用 CAST(X'...' AS TEXT) 强制转换为文本，防止 BLOB 问题，同时彻底避开特殊字符
-    UPDATE global_variables SET variable_value=CAST(X'${ADMIN_CRED_HEX}' AS TEXT) WHERE variable_name='admin-admin_credentials';
+    -- [核心] 更新 Admin 密码 (标准字符串方式)
+    -- 注意: 这里使用了转义后的密码，并用单引号包裹
+    UPDATE global_variables SET variable_value='admin:${SAFE_ADMIN_PASS}' WHERE variable_name='admin-admin_credentials';
 
-    -- 保存配置
     LOAD MYSQL VARIABLES TO RUNTIME; SAVE MYSQL VARIABLES TO DISK;
     LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;
     LOAD MYSQL USERS TO RUNTIME; SAVE MYSQL USERS TO DISK;
@@ -145,6 +141,7 @@ sleep 2
 if check_proxysql "${PROXY_ADMIN_PASS}"; then
     echo -e "${GREEN}✅ 验证成功！ProxySQL 已完美适配复杂密码。${NC}"
 else
-    err "❌ 验证失败！请检查日志。"
+    echo -e "${RED}❌ 验证失败！请尝试重置容器后再试。${NC}"
+    exit 1
 fi
 echo "----------------------------------------------------------"
