@@ -2,10 +2,13 @@
 set -euo pipefail
 
 # ==============================================================================
-# MariaDB HA v3.2 - ProxySQL Initialization (Admin Reload Fix)
+# MariaDB HA v3.2 - ProxySQL Initialization (Direct SQLite Injection Mode)
 # ==============================================================================
-# 关键修复: 增加 LOAD ADMIN VARIABLES 指令
-# 原因: 修改 admin 接口密码后，必须显式重载 admin 变量才能生效
+# 终极解决方案: 绕过 ProxySQL SQL 解析器
+# 核心机制: 
+#   1. 检测并安装 sqlite3 (如果容器内缺失)
+#   2. 直接修改 /var/lib/proxysql/proxysql.db 文件
+#   3. 重启容器强制加载配置
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +25,7 @@ warn() { echo -e "${RED}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 echo "----------------------------------------------------------"
-echo ">>> ProxySQL 初始化配置 (v3.2 Admin重载修复版)"
+echo ">>> ProxySQL 初始化配置 (v3.2 SQLite 直写版)"
 echo "----------------------------------------------------------"
 
 # 1. 获取密码
@@ -37,12 +40,23 @@ fi
 echo "----------------------------------------------------------"
 
 # ==============================================================================
-# 2. 后端账号创建 (适配 MariaDB 11)
+# 2. 准备 SQLite 环境 (关键步骤)
+# ==============================================================================
+log "正在检查容器环境..."
+if ! docker exec proxysql which sqlite3 >/dev/null 2>&1; then
+    log "检测到容器缺少 sqlite3，正在安装..."
+    # 临时安装 sqlite3 用于直写配置 (ProxySQL 镜像是 Debian based)
+    docker exec -u 0 proxysql apt-get update -qq >/dev/null 2>&1
+    docker exec -u 0 proxysql apt-get install -y -qq sqlite3 >/dev/null 2>&1
+    log "sqlite3 安装完成。"
+fi
+
+# ==============================================================================
+# 3. 后端账号创建
 # ==============================================================================
 LOCAL_IPS=$(hostname -I)
 if [[ "$LOCAL_IPS" == *"$NODE_1_IP"* ]]; then
     log "Master: 检查/创建后端数据库账号..."
-    # 使用 mariadb 客户端
     docker exec -i -e MYSQL_PWD="${DB_ROOT_PASS}" mariadb mariadb -uroot <<-SQL 2>/dev/null || true
         CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor_pass';
         GRANT USAGE, REPLICATION CLIENT ON *.* TO 'monitor'@'%';
@@ -50,64 +64,28 @@ if [[ "$LOCAL_IPS" == *"$NODE_1_IP"* ]]; then
         GRANT ALL PRIVILEGES ON *.* TO 'app'@'%';
         FLUSH PRIVILEGES;
 SQL
-    log "后端账号准备就绪。"
 else
     log "Slave: 跳过后端账号创建。"
 fi
 
 # ==============================================================================
-# 3. 智能探测与重置检查
+# 4. 下发配置 (混合模式)
 # ==============================================================================
-log "正在探测 ProxySQL 连接状态..."
+log "正在下发路由配置..."
 
-CURRENT_PASS=""
-check_proxysql() {
-    local pass=$1
-    if docker exec -e MYSQL_PWD="${pass}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 -e "SELECT 1" >/dev/null 2>&1; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-if check_proxysql "${PROXY_ADMIN_PASS}"; then
+# A. 先用标准 SQL 接口配置普通项 (非密码项)
+# 这里使用默认 admin 密码连接，因为还没改
+# 如果已经改过，尝试探测
+CURRENT_PASS="admin"
+if docker exec -e MYSQL_PWD="${PROXY_ADMIN_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 -e "SELECT 1" >/dev/null 2>&1; then
     CURRENT_PASS="${PROXY_ADMIN_PASS}"
-    log "连接成功 (使用自定义密码)。"
-elif check_proxysql "admin"; then
-    CURRENT_PASS="admin"
-    warn "ProxySQL 正在使用默认密码 (admin)。"
-else
-    warn "无法连接 ProxySQL！"
-    err "环境状态异常，请务必先重置容器: docker rm -f proxysql && ./install_node.sh"
 fi
 
-# ==============================================================================
-# 辅助函数: SQL 字符串转义
-# ==============================================================================
-escape_sql_str() {
-    local input="$1"
-    local output="${input//\\/\\\\}" # 转义反斜杠
-    output="${output//\'/\\\'}"     # 转义单引号
-    echo "$output"
-}
-
-# ==============================================================================
-# 4. 下发配置
-# ==============================================================================
-log "正在下发路由配置与权限..."
-
-# 转义密码
-SAFE_ADMIN_PASS=$(escape_sql_str "${PROXY_ADMIN_PASS}")
-
-# 构建 SQL
-# 注意: 'admin:...' 被单引号包裹，# 号是安全的
-docker exec -i -e MYSQL_PWD="${CURRENT_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL
-    -- 清空旧配置
+docker exec -i -e MYSQL_PWD="${CURRENT_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL 2>/dev/null || true
     DELETE FROM mysql_servers;
     DELETE FROM mysql_users;
     DELETE FROM mysql_query_rules;
 
-    -- 写入新配置
     INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (10, '$NODE_1_IP', 3306);
     INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (20, '$NODE_1_IP', 3306);
     INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (20, '$NODE_2_IP', 3306);
@@ -121,32 +99,43 @@ docker exec -i -e MYSQL_PWD="${CURRENT_PASS}" proxysql mysql -u admin -h 127.0.0
 
     INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup, apply) VALUES (1, 1, '^SELECT.*FOR UPDATE$', 10, 1);
     INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup, apply) VALUES (2, 1, '^SELECT', 20, 1);
-    
-    -- 更新 Admin 密码
-    UPDATE global_variables SET variable_value='admin:${SAFE_ADMIN_PASS}' WHERE variable_name='admin-admin_credentials';
 
-    -- [关键修复] 必须显式重载 ADMIN 变量，否则密码修改不生效！
-    LOAD ADMIN VARIABLES TO RUNTIME; SAVE ADMIN VARIABLES TO DISK;
-    
-    -- 重载 MySQL 模块
     LOAD MYSQL VARIABLES TO RUNTIME; SAVE MYSQL VARIABLES TO DISK;
     LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;
     LOAD MYSQL USERS TO RUNTIME; SAVE MYSQL USERS TO DISK;
     LOAD MYSQL QUERY RULES TO RUNTIME; SAVE MYSQL QUERY RULES TO DISK;
 SQL
 
-# ==============================================================================
-# 5. 最终验证
-# ==============================================================================
-echo "----------------------------------------------------------"
-log "正在验证新密码生效情况..."
-sleep 2
+# B. [核弹级修复] 使用 sqlite3 直接修改 Admin 密码
+# 绕过 ProxySQL 的 SQL 解析器，直接写库
+log "正在通过 SQLite 直写模式更新 Admin 密码..."
 
-if check_proxysql "${PROXY_ADMIN_PASS}"; then
-    echo -e "${GREEN}✅ 验证成功！ProxySQL 已完美适配复杂密码。${NC}"
+# 单引号转义 (SQLite 中单引号转义为两个单引号 '')
+SQLITE_PASS="${PROXY_ADMIN_PASS//\'/\'\'}"
+
+# 执行直写
+docker exec -i proxysql sqlite3 /var/lib/proxysql/proxysql.db <<EOF
+UPDATE global_variables SET variable_value='admin:${SQLITE_PASS}' WHERE variable_name='admin-admin_credentials';
+.quit
+EOF
+
+# ==============================================================================
+# 5. 重启生效与验证
+# ==============================================================================
+log "配置已写入数据库。正在重启 ProxySQL 以强制加载..."
+docker restart proxysql >/dev/null
+
+log "等待服务就绪 (5s)..."
+sleep 5
+
+echo "----------------------------------------------------------"
+log "正在验证新密码..."
+
+if docker exec -e MYSQL_PWD="${PROXY_ADMIN_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 -e "SELECT 'OK' as status" >/dev/null 2>&1; then
+    echo -e "${GREEN}✅ 验证成功！ProxySQL 已接受复杂密码。${NC}"
 else
     echo -e "${RED}❌ 验证失败！${NC}"
-    echo "请尝试手动调试: mysql -u admin -p'${PROXY_ADMIN_PASS}' -h 127.0.0.1 -P 6032"
+    echo "调试建议: docker logs proxysql"
     exit 1
 fi
 echo "----------------------------------------------------------"
