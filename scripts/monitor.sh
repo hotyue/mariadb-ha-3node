@@ -2,11 +2,11 @@
 set -u
 
 # ==============================================================================
-# MariaDB HA v3.0 - Auto Monitor & Failover (Sentinel)
+# MariaDB HA v3.2 - Auto Monitor (EnvVar Injection)
 # ==============================================================================
 # 依赖: 必须先运行 scripts/save_secrets.sh 生成 .secrets.env
-# Fix 1: 针对密码变量增加双引号 "$VAR" 包裹，防止 Shell 解析特殊字符
-# Fix 2: 替换 mysqladmin 为 mariadb-admin (适配新版容器)，增加 SQL 连接兜底
+# Fix 1: 使用 MYSQL_PWD 环境变量传递密码，彻底支持特殊字符 (*, #, @, !)
+# Fix 2: 兼容性健康检查 (mariadb-admin / mysqladmin / SQL)
 # ==============================================================================
 
 # 1. 基础配置
@@ -47,7 +47,7 @@ if [[ "$LOCAL_IPS" == *"$NODE_1_IP"* ]]; then MY_ROLE="NODE_1"; fi
 if [[ "$LOCAL_IPS" == *"$NODE_2_IP"* ]]; then MY_ROLE="NODE_2"; fi
 if [[ "$LOCAL_IPS" == *"$NODE_3_IP"* ]]; then MY_ROLE="NODE_3"; fi
 
-log ">>> 哨兵启动 (Monitor v3.1-Stable)"
+log ">>> 哨兵启动 (Monitor v3.2-EnvVar)"
 log ">>> 监控目标: Node-1 ($NODE_1_IP)"
 log ">>> 本机角色: $MY_ROLE"
 
@@ -67,7 +67,6 @@ check_master_health() {
     fi
     
     # 方法 C: 尝试 SQL 简单查询 (最底层兜底，只要能连上就算活)
-    # DO 1; 是开销最小的 SQL 语句
     if docker exec mariadb mariadb -h "$target_ip" -u monitor -pmonitor_pass -e "DO 1;" --connect-timeout=3 >/dev/null 2>&1; then
         return 0
     fi
@@ -77,14 +76,15 @@ check_master_health() {
 }
 
 # ==============================================================================
-# 核心函数 (已加固密码引用)
+# 核心函数 (使用环境变量注入密码)
 # ==============================================================================
 
 promote_db_to_master() {
     log ">>> [DB Action] 正在停止复制并提升为主库..."
     
-    # [FIX] 使用 "$VAR" 双引号包裹密码，防止 * 被解析为通配符
-    docker exec mariadb mariadb -uroot -p"$AUTO_DB_ROOT_PASS" -e \
+    # [FIX] 使用 -e MYSQL_PWD 传递 Root 密码
+    # 避免 CLI 参数解析问题 (如 # 被视为注释)
+    docker exec -e MYSQL_PWD="$AUTO_DB_ROOT_PASS" mariadb mariadb -uroot -e \
         "STOP SLAVE; RESET SLAVE ALL; SET GLOBAL read_only=0;" >> "$LOG_FILE" 2>&1
         
     if [ $? -eq 0 ]; then
@@ -98,8 +98,9 @@ switch_proxysql_routing() {
     local new_writer_ip=$1
     log ">>> [ProxySQL Action] 将写流量 (HG 10) 切换至: $new_writer_ip"
 
-    # [FIX] 使用 "$VAR" 双引号包裹密码
-    docker exec proxysql mysql -u admin -p"$AUTO_PROXY_ADMIN_PASS" -h 127.0.0.1 -P 6032 <<-SQL >> "$LOG_FILE" 2>&1
+    # [FIX] 使用 -e MYSQL_PWD 传递 Admin 密码
+    # 这里是处理特殊字符最关键的地方
+    docker exec -e MYSQL_PWD="$AUTO_PROXY_ADMIN_PASS" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL >> "$LOG_FILE" 2>&1
         -- 1. 删除旧的 Writer
         DELETE FROM mysql_servers WHERE hostgroup_id=10;
         
@@ -110,7 +111,13 @@ switch_proxysql_routing() {
         LOAD MYSQL SERVERS TO RUNTIME;
         SAVE MYSQL SERVERS TO DISK;
 SQL
-    log ">>> [Success] 本地 ProxySQL 路由已更新。"
+    
+    # 增加简单的退出码检查
+    if [ $? -eq 0 ]; then
+        log ">>> [Success] 本地 ProxySQL 路由已更新。"
+    else
+        log ">>> [Error] ProxySQL 更新失败 (Access Denied 或 容器未运行)。"
+    fi
 }
 
 # ==============================================================================
@@ -120,7 +127,7 @@ SQL
 while true; do
     if [ "$MY_ROLE" == "NODE_1" ]; then sleep 60; continue; fi
 
-    # 调用兼容性检测函数，不再直接依赖 mysqladmin
+    # 调用兼容性检测函数
     if check_master_health "$NODE_1_IP"; then
         # === Master 活着 ===
         if [ $FAIL_COUNT -gt 0 ]; then

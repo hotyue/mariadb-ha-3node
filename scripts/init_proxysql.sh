@@ -2,7 +2,9 @@
 set -e
 
 # ==============================================================================
-# MariaDB HA v3.0 - ProxySQL Initialization (Smart Fix)
+# MariaDB HA v3.2 - ProxySQL Initialization (EnvVar Hardened)
+# ==============================================================================
+# 修复: 全面使用 MYSQL_PWD 环境变量传递密码，彻底解决特殊字符(*, #, @)问题
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,16 +20,16 @@ log() { echo -e "${BLUE}[INFO]${NC} $1"; }
 warn() { echo -e "${RED}[WARN]${NC} $1"; }
 
 echo "----------------------------------------------------------"
-echo ">>> ProxySQL 初始化配置 (智能模式)"
+echo ">>> ProxySQL 初始化配置 (v3.2 特殊字符增强版)"
 echo "----------------------------------------------------------"
 
-# 1. 获取用户期望的密码
+# 1. 获取用户期望的密码 (使用 -r 防止转义)
 if [ -z "$DB_ROOT_PASS" ]; then
-    read -s -p "1. 请输入 DB Root 密码: " DB_ROOT_PASS
+    read -r -s -p "1. 请输入 DB Root 密码: " DB_ROOT_PASS
     echo ""
 fi
 if [ -z "$PROXY_ADMIN_PASS" ]; then
-    read -s -p "2. 请输入 ProxySQL Admin 密码 (你期望设置的): " PROXY_ADMIN_PASS
+    read -r -s -p "2. 请输入 ProxySQL Admin 密码 (你期望设置的): " PROXY_ADMIN_PASS
     echo ""
 fi
 echo "----------------------------------------------------------"
@@ -42,7 +44,8 @@ fi
 # 3. 后端账号创建 (仅 Master)
 if [ "$AM_I_MASTER" -eq 1 ]; then
     log "Master: 检查/创建后端数据库账号..."
-    docker exec -i mariadb mariadb -uroot -p"${DB_ROOT_PASS}" <<-SQL 2>/dev/null || true
+    # [FIX] 使用 MYSQL_PWD 传递 Root 密码
+    docker exec -i -e MYSQL_PWD="${DB_ROOT_PASS}" mariadb mariadb -uroot <<-SQL 2>/dev/null || true
         CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor_pass';
         GRANT USAGE, REPLICATION CLIENT ON *.* TO 'monitor'@'%';
         CREATE USER IF NOT EXISTS 'app'@'%' IDENTIFIED BY 'app_pass';
@@ -61,24 +64,32 @@ fi
 log "正在连接 ProxySQL Sidecar..."
 
 CURRENT_PASS=""
-# 尝试 1: 使用用户输入的密码
-if docker exec -i proxysql mysql -u admin -p"${PROXY_ADMIN_PASS}" -h 127.0.0.1 -P 6032 -e "SELECT 1" >/dev/null 2>&1; then
+
+# 定义探测函数，使用 MYSQL_PWD 避免特殊字符问题
+check_proxysql_pass() {
+    local pass=$1
+    if docker exec -e MYSQL_PWD="${pass}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 -e "SELECT 1" >/dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# 尝试 1: 使用用户输入的密码 (如果之前已经初始化过)
+if check_proxysql_pass "${PROXY_ADMIN_PASS}"; then
     CURRENT_PASS="${PROXY_ADMIN_PASS}"
     log "连接成功 (使用自定义密码)。"
+
 # 尝试 2: 使用默认密码 'admin'
-elif docker exec -i proxysql mysql -u admin -p"admin" -h 127.0.0.1 -P 6032 -e "SELECT 1" >/dev/null 2>&1; then
+elif check_proxysql_pass "admin"; then
     CURRENT_PASS="admin"
     warn "发现 ProxySQL 正在使用默认密码 (admin)。脚本将自动将其修改为您设定的密码。"
+
 else
-    # 尝试 3: 使用默认密码 'radmin' (某些旧版本)
-    if docker exec -i proxysql mysql -u radmin -p"radmin" -h 127.0.0.1 -P 6032 -e "SELECT 1" >/dev/null 2>&1; then
-        CURRENT_PASS="radmin" # 注意：radmin 用户通常也是 admin 权限，但这里我们假设是 admin 用户
-    else 
-        echo -e "${RED}[ERROR] 无法连接到 ProxySQL!${NC}"
-        echo "请检查容器是否运行: docker ps"
-        echo "请尝试使用默认密码 admin 或您设置的密码手动连接测试。"
-        exit 1
-    fi
+    echo -e "${RED}[ERROR] 无法连接到 ProxySQL!${NC}"
+    echo "请检查容器是否运行: docker ps"
+    echo "请尝试使用默认密码 admin 或您设置的密码手动连接测试。"
+    exit 1
 fi
 
 # ==============================================================================
@@ -86,17 +97,20 @@ fi
 # ==============================================================================
 log "正在下发路由规则..."
 
-docker exec -i proxysql mysql -u admin -p"${CURRENT_PASS}" -h 127.0.0.1 -P 6032 <<-SQL
-    -- 1. 每次初始化前先清理，防止配置冲突
+# [FIX] 使用 MYSQL_PWD 传递当前的 Admin 密码
+# 注意：Here-Doc 中的变量会被 Shell 展开，但因为是在 SQL 字符串内部，
+# 且通过 docker exec 的 stdin 传输，这比直接在命令行参数里写密码要安全得多。
+docker exec -i -e MYSQL_PWD="${CURRENT_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL
+    -- 1. 每次初始化前先清理
     DELETE FROM mysql_servers;
     DELETE FROM mysql_users;
     DELETE FROM mysql_query_rules;
 
     -- 2. 添加后端节点
-    -- Writer (HG 10): 仅 Master
+    -- Writer (HG 10)
     INSERT INTO mysql_servers (hostgroup_id, hostname, port, max_replication_lag) VALUES (10, '$NODE_1_IP', 3306, 20);
     
-    -- Readers (HG 20): Master + Slaves
+    -- Readers (HG 20)
     INSERT INTO mysql_servers (hostgroup_id, hostname, port, max_replication_lag) VALUES (20, '$NODE_1_IP', 3306, 20);
     INSERT INTO mysql_servers (hostgroup_id, hostname, port, max_replication_lag) VALUES (20, '$NODE_2_IP', 3306, 20);
     INSERT INTO mysql_servers (hostgroup_id, hostname, port, max_replication_lag) VALUES (20, '$NODE_3_IP', 3306, 20);
@@ -108,18 +122,17 @@ docker exec -i proxysql mysql -u admin -p"${CURRENT_PASS}" -h 127.0.0.1 -P 6032 
     UPDATE global_variables SET variable_value='2000' WHERE variable_name='mysql-monitor_connect_interval';
     UPDATE global_variables SET variable_value='2000' WHERE variable_name='mysql-monitor_ping_interval';
     
-    -- 业务用户 (app) -> 默认走主库 (HG 10)
+    -- 业务用户
     INSERT INTO mysql_users (username, password, default_hostgroup) VALUES ('app', 'app_pass', 10);
 
     -- 4. 读写分离规则
-    -- FOR UPDATE 走主库
     INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup, apply)
     VALUES (1, 1, '^SELECT.*FOR UPDATE$', 10, 1);
-    -- 普通 SELECT 走从库
     INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup, apply)
     VALUES (2, 1, '^SELECT', 20, 1);
 
-    -- 5. [关键] 修改 Admin 密码 (如果我们使用的是默认密码)
+    -- 5. [关键] 修改 Admin 密码
+    -- 只有当当前密码不等于新密码时才更新，但为了确保一致性，强制更新
     UPDATE global_variables SET variable_value='admin:${PROXY_ADMIN_PASS}' WHERE variable_name='admin-admin_credentials';
 
     -- 6. 保存所有配置
