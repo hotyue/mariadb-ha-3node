@@ -101,7 +101,6 @@ else
     
     if [[ "${IO}" == "Yes" && "${SQL}" == "Yes" ]]; then
         echo -e "\033[0;32m>>> 成功！复制正在运行 (IO: Yes, SQL: Yes)\033[0m"
-        [Image of successful database replication verification]
     else
         echo -e "\033[0;31m>>> 警告！复制状态异常 (IO: ${IO}, SQL: ${SQL})\033[0m"
         echo "请检查防火墙端口 ${DB_PORT} 是否开放，或密码是否正确。"
