@@ -2,13 +2,10 @@
 set -euo pipefail
 
 # ==============================================================================
-# MariaDB HA v3.2 - ProxySQL Initialization (SQLite Direct Mode)
+# MariaDB HA v3.2 - ProxySQL Initialization (Offline Repair Mode)
 # ==============================================================================
-# 终极方案: 绕过 SQL 协议，直接修改 SQLite 文件
-# 机制: 
-#   1. 检测并安装 sqlite3 (如果容器内缺失)
-#   2. 直接 Update /var/lib/proxysql/proxysql.db
-#   3. 重启容器强制加载配置
+# 终极方案: 停机 -> 挂载数据卷 -> 修改 DB -> 开机
+# 解决痛点: 彻底避开 ProxySQL "关机回写" 覆盖配置的问题，同时无视 SQL 解析器 bug
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,7 +22,7 @@ warn() { echo -e "${RED}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 echo "----------------------------------------------------------"
-echo ">>> ProxySQL 初始化配置 (v3.2 SQLite 直写版)"
+echo ">>> ProxySQL 初始化配置 (v3.2 停机冷改版)"
 echo "----------------------------------------------------------"
 
 # 1. 获取密码
@@ -40,19 +37,7 @@ fi
 echo "----------------------------------------------------------"
 
 # ==============================================================================
-# 2. 准备 SQLite 环境 (关键步骤)
-# ==============================================================================
-log "正在检查容器环境..."
-# 检查是否需要安装 sqlite3 (ProxySQL 官方镜像基于 Debian)
-if ! docker exec proxysql which sqlite3 >/dev/null 2>&1; then
-    log "检测到容器缺少 sqlite3，正在安装..."
-    docker exec -u 0 proxysql apt-get update -qq >/dev/null 2>&1
-    docker exec -u 0 proxysql apt-get install -y -qq sqlite3 >/dev/null 2>&1
-    log "sqlite3 安装完成。"
-fi
-
-# ==============================================================================
-# 3. 后端账号创建
+# 2. 后端账号创建 (Master 节点执行)
 # ==============================================================================
 LOCAL_IPS=$(hostname -I)
 if [[ "$LOCAL_IPS" == *"$NODE_1_IP"* ]]; then
@@ -69,18 +54,17 @@ else
 fi
 
 # ==============================================================================
-# 4. 下发配置 (混合模式)
+# 3. 基础路由配置 (在线模式)
 # ==============================================================================
-log "正在下发路由配置..."
+# 先把不需要重启就能生效的路由规则配好
+log "正在下发基础路由配置..."
 
-# A. 先用标准 SQL 接口配置普通项 (连接 Admin 接口)
-# 此时密码可能是 admin 也可能是新密码，先探测
+# 探测当前密码 (默认为 admin)
 CURRENT_PASS="admin"
 if docker exec -e MYSQL_PWD="${PROXY_ADMIN_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 -e "SELECT 1" >/dev/null 2>&1; then
     CURRENT_PASS="${PROXY_ADMIN_PASS}"
 fi
 
-# 执行基础配置 (不改密码)
 docker exec -i -e MYSQL_PWD="${CURRENT_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL 2>/dev/null || true
     DELETE FROM mysql_servers;
     DELETE FROM mysql_users;
@@ -100,40 +84,51 @@ docker exec -i -e MYSQL_PWD="${CURRENT_PASS}" proxysql mysql -u admin -h 127.0.0
     INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup, apply) VALUES (1, 1, '^SELECT.*FOR UPDATE$', 10, 1);
     INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup, apply) VALUES (2, 1, '^SELECT', 20, 1);
 
-    -- 保存到磁盘 (这样下面直接改 DB 文件才不会被覆盖)
+    -- 保存到磁盘，为停机修改做准备
     LOAD MYSQL VARIABLES TO RUNTIME; SAVE MYSQL VARIABLES TO DISK;
     LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;
     LOAD MYSQL USERS TO RUNTIME; SAVE MYSQL USERS TO DISK;
     LOAD MYSQL QUERY RULES TO RUNTIME; SAVE MYSQL QUERY RULES TO DISK;
 SQL
 
-# B. [核弹级修复] 使用 sqlite3 直接修改 Admin 密码
-# 绕过 SQL 协议解析器，直接写入文件
-log "正在通过 SQLite 直写模式更新 Admin 密码..."
+# ==============================================================================
+# 4. 核弹级修复: 停机冷修改 Admin 密码
+# ==============================================================================
+log "正在停止 ProxySQL 以进行冷修改..."
+docker stop proxysql >/dev/null
 
-# 仅仅需要转义 SQLite 的单引号 (即 ' 变成 '')
-# 这比处理 Shell/MySQL 的转义简单且安全得多
+log "启动临时工兵容器修改数据库文件..."
+# 转义 SQLite 单引号
 SQLITE_PASS="${PROXY_ADMIN_PASS//\'/\'\'}"
 
-# 直接操作 DB 文件
-docker exec -i proxysql sqlite3 /var/lib/proxysql/proxysql.db <<EOF
-UPDATE global_variables SET variable_value='admin:${SQLITE_PASS}' WHERE variable_name='admin-admin_credentials';
-.quit
-EOF
+# 
+# 核心逻辑：
+# 1. 挂载原有数据卷
+# 2. 安装 sqlite3
+# 3. 传入环境变量 (避免 Shell 解析 # 号)
+# 4. 修改 DB 并修正文件权限
+docker run --rm \
+    -v mariadb-ha-3node_proxysql_data:/var/lib/proxysql \
+    -e ADMIN_PASS="${SQLITE_PASS}" \
+    --entrypoint /bin/bash \
+    proxysql/proxysql:latest \
+    -c "apt-get update -qq && \
+        apt-get install -y -qq sqlite3 && \
+        sqlite3 /var/lib/proxysql/proxysql.db \"UPDATE global_variables SET variable_value='admin:' || '\$ADMIN_PASS' WHERE variable_name='admin-admin_credentials';\" && \
+        chown -R proxysql:proxysql /var/lib/proxysql"
 
-# ==============================================================================
-# 5. 重启生效与验证
-# ==============================================================================
-log "配置已写入数据库。正在重启 ProxySQL 以强制加载..."
-docker restart proxysql >/dev/null
+log "冷修改完成，正在重启 ProxySQL..."
+docker start proxysql >/dev/null
 
 log "等待服务就绪 (5s)..."
 sleep 5
 
+# ==============================================================================
+# 5. 最终验证
+# ==============================================================================
 echo "----------------------------------------------------------"
 log "正在验证新密码..."
 
-# 使用新密码连接
 if docker exec -e MYSQL_PWD="${PROXY_ADMIN_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 -e "SELECT 'OK' as status" >/dev/null 2>&1; then
     echo -e "${GREEN}✅ 验证成功！ProxySQL 已接受复杂密码。${NC}"
 else
