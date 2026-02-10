@@ -2,10 +2,12 @@
 set -euo pipefail
 
 # ==============================================================================
-# MariaDB HA v3.2 - ProxySQL Initialization (File Injection Mode)
+# MariaDB HA v3.2 - ProxySQL Initialization (Hex-SQLite Diagnostic Mode)
 # ==============================================================================
-# 绝杀方案: 宿主机生成 SQL 文件 -> 挂载入容器 -> sqlite3 读取文件执行
-# 核心优势: 彻底绕过 Bash/Shell 参数解析，无视任何特殊字符 (#, ', ", \, $)
+# 绝杀方案: Hex 编码 -> SQLite 文件注入 -> 显式报错
+# 核心逻辑:
+#   1. 将密码转换为 Hex，使用 SQLite 的 X'...' 语法写入，物理隔绝字符干扰
+#   2. 验证阶段输出详细的 MySQL Client 报错，定位到底是密码错还是连不上
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +24,7 @@ warn() { echo -e "${RED}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 echo "----------------------------------------------------------"
-echo ">>> ProxySQL 初始化配置 (v3.2 文件注入绝杀版)"
+echo ">>> ProxySQL 初始化配置 (v3.2 Hex-SQLite 诊断版)"
 echo "----------------------------------------------------------"
 
 # 1. 获取密码
@@ -37,7 +39,7 @@ fi
 echo "----------------------------------------------------------"
 
 # ==============================================================================
-# 2. 后端账号创建 (仅 Master)
+# 2. 后端账号创建 (Master 节点执行)
 # ==============================================================================
 LOCAL_IPS=$(hostname -I)
 if [[ "$LOCAL_IPS" == *"$NODE_1_IP"* ]]; then
@@ -58,13 +60,13 @@ fi
 # ==============================================================================
 log "正在下发基础路由配置..."
 
-# 探测当前密码 (尝试 admin)
+# 探测当前密码 (尝试 admin，若失败则假设已是新密码)
 CURRENT_PASS="admin"
 if docker exec -e MYSQL_PWD="${PROXY_ADMIN_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 -e "SELECT 1" >/dev/null 2>&1; then
     CURRENT_PASS="${PROXY_ADMIN_PASS}"
 fi
 
-# 先配置不涉及 Admin 密码的部分
+# 配置基础项
 docker exec -i -e MYSQL_PWD="${CURRENT_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL 2>/dev/null || true
     DELETE FROM mysql_servers;
     DELETE FROM mysql_users;
@@ -84,7 +86,7 @@ docker exec -i -e MYSQL_PWD="${CURRENT_PASS}" proxysql mysql -u admin -h 127.0.0
     INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup, apply) VALUES (1, 1, '^SELECT.*FOR UPDATE$', 10, 1);
     INSERT INTO mysql_query_rules (rule_id, active, match_digest, destination_hostgroup, apply) VALUES (2, 1, '^SELECT', 20, 1);
 
-    -- 关键：保存配置到磁盘，确保后续冷修改是在此基础上进行
+    -- 落地磁盘
     LOAD MYSQL VARIABLES TO RUNTIME; SAVE MYSQL VARIABLES TO DISK;
     LOAD MYSQL SERVERS TO RUNTIME; SAVE MYSQL SERVERS TO DISK;
     LOAD MYSQL USERS TO RUNTIME; SAVE MYSQL USERS TO DISK;
@@ -92,58 +94,70 @@ docker exec -i -e MYSQL_PWD="${CURRENT_PASS}" proxysql mysql -u admin -h 127.0.0
 SQL
 
 # ==============================================================================
-# 4. 绝杀修复: 停机 -> 挂载 SQL 文件 -> 执行
+# 4. Hex-SQLite 物理注入修复
 # ==============================================================================
-log "正在停止 ProxySQL 以进行文件注入修复..."
+log "正在停止 ProxySQL 以进行 Hex 物理注入..."
 docker stop proxysql >/dev/null
 
-# A. 在宿主机生成 SQL 文件
-# 使用 printf 确保特殊字符原样写入文件，不经过 Shell 解析
-# SQLite 中单引号需要转义为 ''
-SQLITE_PASS="${PROXY_ADMIN_PASS//\'/\'\'}"
-SQL_FILE="/tmp/proxysql_reset_admin.sql"
+# A. 计算 Hex 值 (在宿主机完成，绝对安全)
+# 使用 od 将字符串转换为纯 hex，tr 删除换行
+ADMIN_PASS_HEX=$(printf "%s" "${PROXY_ADMIN_PASS}" | od -An -tx1 | tr -d ' \n')
+# 目标格式: admin:PASSWORD (Hex)
+# 我们将分别拼接 'admin:' 和 Hex密码，确保 SQLite 正确处理
+log "密码 Hex 指纹: ${ADMIN_PASS_HEX:0:8}..."
 
-# 写入 SQL 文件 (这是在宿主机上，绝对安全)
-printf "UPDATE global_variables SET variable_value='admin:%s' WHERE variable_name='admin-admin_credentials';\n" "${SQLITE_PASS}" > "${SQL_FILE}"
+# B. 生成 SQL 文件
+SQL_FILE="/tmp/proxysql_hex_fix.sql"
+# SQLite 语法: 'admin:' || CAST(x'HEXVALUE' AS TEXT)
+# 这会将 hex 转换回 text 并拼接到 admin: 后面，彻底避开任何字符解析问题
+cat <<EOF > "${SQL_FILE}"
+UPDATE global_variables 
+SET variable_value = 'admin:' || CAST(x'${ADMIN_PASS_HEX}' AS TEXT) 
+WHERE variable_name = 'admin-admin_credentials';
+.quit
+EOF
 chmod 644 "${SQL_FILE}"
 
-log "启动临时工兵容器，挂载 SQL 文件直接执行..."
-
-# B. 启动临时容器，挂载 volumes 和 SQL 文件
-# 注意：容器内命令不再包含密码变量，只引用文件路径
+log "启动工兵容器，执行 Hex 注入..."
 docker run --rm \
     -v mariadb-ha-3node_proxysql_data:/var/lib/proxysql \
-    -v "${SQL_FILE}":/update_admin.sql \
+    -v "${SQL_FILE}":/hex_fix.sql \
     proxysql/proxysql:latest \
     /bin/bash -c "apt-get update -qq && \
                   apt-get install -y -qq sqlite3 && \
-                  sqlite3 /var/lib/proxysql/proxysql.db < /update_admin.sql && \
+                  sqlite3 /var/lib/proxysql/proxysql.db < /hex_fix.sql && \
                   chown -R proxysql:proxysql /var/lib/proxysql"
 
-# 清理宿主机临时文件
 rm -f "${SQL_FILE}"
 
-log "文件注入完成，正在重启 ProxySQL..."
+log "注入完成，正在重启 ProxySQL..."
 docker start proxysql >/dev/null
 
 log "等待服务就绪 (5s)..."
 sleep 5
 
 # ==============================================================================
-# 5. 最终验证
+# 5. 显式验证 (带报错输出)
 # ==============================================================================
 echo "----------------------------------------------------------"
 log "正在验证新密码..."
 
-if docker exec -e MYSQL_PWD="${PROXY_ADMIN_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 -e "SELECT 'OK' as status" >/dev/null 2>&1; then
+# 尝试连接，如果失败则捕获输出
+OUTPUT=$(docker exec -e MYSQL_PWD="${PROXY_ADMIN_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 -e "SELECT 'OK' as status" 2>&1)
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}✅ 验证成功！ProxySQL 已接受复杂密码。${NC}"
-    # 触发一个成功的流程图示意
     
 else
-    echo -e "${RED}❌ 验证失败！${NC}"
-    echo "调试建议: docker logs proxysql"
-    # 尝试输出一下当前的变量值 (需要默认密码)
-    # docker exec -e MYSQL_PWD="admin" proxysql mysql -u admin -h 127.0.0.1 -P 6032 -e "SELECT * FROM global_variables WHERE variable_name='admin-admin_credentials'"
+    echo -e "${RED}❌ 验证失败！MySQL 客户端报错如下：${NC}"
+    echo "----------------------------------------------------------"
+    echo "${OUTPUT}"
+    echo "----------------------------------------------------------"
+    echo "可能原因分析:"
+    echo "1. 'Access denied': 密码已写入，但与输入不匹配 (特殊字符或编码问题)。"
+    echo "2. 'Can't connect': ProxySQL 服务未启动。"
+    echo "如果报错是 Access denied，说明密码中的 * 或 # 导致了特殊的 Hash 识别问题。"
     exit 1
 fi
 echo "----------------------------------------------------------"
