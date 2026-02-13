@@ -2,14 +2,14 @@
 set -e
 
 # ==============================================================================
-# MariaDB HA v3.3 - Bootstrap (One-Click Installer)
+# MariaDB HA v3.3 - Bootstrap (Final Fix: Hash Calc Crash)
 # ==============================================================================
 # 部署架构:
 #   Root Base:   /opt/docker
 #   Project Dir: /opt/docker/mariadb-ha-3node
 # 版本特性:
 #   - 自动适配 v3.3 安全架构 (双态存储: 明文 + Hash)
-#   - 兼容 GitHub Main 分支结构
+#   - 修复: 临时容器启动失败导致脚本中断的问题
 # ==============================================================================
 
 # 配置
@@ -95,11 +95,11 @@ chmod +x install_node.sh scripts/*.sh
 
 echo -e "${BLUE}>>> [3/5] 开始安装节点软件 (Docker + Sidecar)${NC}"
 echo "-------------------------------------------------------"
-# 启动容器 (这一步会安装 Docker 并拉取镜像，为后面计算 Hash 做准备)
+# 启动容器
 ./install_node.sh
 
 # ==============================================================================
-# [4/5] 录入安全凭据 (双态存储升级版)
+# [4/5] 录入安全凭据 (修复版: 解决容器退出导致脚本中断)
 # ==============================================================================
 echo ""
 echo -e "${BLUE}>>> [4/5] 录入安全凭据 (v3.3 Dual-State Mode)${NC}"
@@ -108,11 +108,11 @@ echo "Monitor 和 ProxySQL 需要统一的凭据文件才能工作。"
 echo "系统将自动生成明文和哈希两个版本的凭据。"
 echo "-------------------------------------------------------"
 
-# 定义哈希生成函数
+# [核心修复] 定义哈希生成函数
+# 必须增加 -e MARIADB_ROOT_PASSWORD=temp，否则 mariadb 容器会因无密码直接退出
 generate_hash() {
     local pwd="$1"
-    # 利用 install_node.sh 刚刚拉取的 mariadb 镜像来计算哈希
-    docker run --rm mariadb:latest mariadb -N -e "SELECT PASSWORD('${pwd}')" 2>/dev/null
+    docker run --rm -e MARIADB_ROOT_PASSWORD=temp mariadb:latest mariadb -N -e "SELECT PASSWORD('${pwd}')" 2>/dev/null
 }
 
 # 交互式录入 Root 密码
@@ -148,9 +148,14 @@ echo "正在计算加密哈希 (使用 MariaDB 引擎)..."
 ROOT_HASH=$(generate_hash "${ROOT_PASS}")
 PROXY_HASH=$(generate_hash "${PROXY_PASS}")
 
+# 安全检查：确保哈希计算成功
+if [ -z "$ROOT_HASH" ] || [ -z "$PROXY_HASH" ]; then
+    echo -e "${RED}错误：哈希计算失败！请检查 Docker 运行状态。${NC}"
+    exit 1
+fi
+
 echo "正在生成双态凭据文件..."
 
-# [修正] 使用 PROJECT_DIR 而不是 BASE_DIR
 SECRETS_FILE="${PROJECT_DIR}/.secrets.env"
 
 cat > "${SECRETS_FILE}" <<EOF
@@ -170,8 +175,6 @@ EOF
 chmod 600 "${SECRETS_FILE}"
 echo -e "${GREEN}>>> 成功！凭据已保存至: .secrets.env${NC}"
 echo "    包含明文与哈希双重校验，安全等级: High"
-
-# [修正] 删除了 redundant 的 ./scripts/save_secrets.sh 调用
 
 sleep 1
 
