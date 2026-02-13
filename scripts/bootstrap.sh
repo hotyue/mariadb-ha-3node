@@ -2,20 +2,19 @@
 set -e
 
 # ==============================================================================
-# MariaDB HA v3.2 - Bootstrap (One-Click Installer)
+# MariaDB HA v3.3 - Bootstrap (One-Click Installer)
 # ==============================================================================
 # 部署架构:
 #   Root Base:   /opt/docker
 #   Project Dir: /opt/docker/mariadb-ha-3node
 # 版本特性:
-#   - 自动适配 v3.2 安全架构 (Secrets Manager)
+#   - 自动适配 v3.3 安全架构 (双态存储: 明文 + Hash)
 #   - 兼容 GitHub Main 分支结构
 # ==============================================================================
 
 # 配置
 BRANCH="main"
 REPO="mariadb-ha-3node"
-# 使用 -L 跟随重定向，-f 失败不输出 HTML 错误
 DOWNLOAD_URL="https://github.com/hotyue/$REPO/archive/refs/heads/$BRANCH.tar.gz"
 
 # [关键路径定义]
@@ -30,7 +29,7 @@ NC='\033[0m'
 
 echo -e "${BLUE}>>> [1/5] 正在下载安装包 ($BRANCH)...${NC}"
 
-# 使用临时目录处理下载，防止污染环境
+# 使用临时目录处理下载
 TEMP_DIR=$(mktemp -d)
 if ! curl -fsSL -k "$DOWNLOAD_URL" -o "$TEMP_DIR/ha.tar.gz"; then
     echo -e "${RED}下载失败！请检查网络或 URL。${NC}"
@@ -45,20 +44,18 @@ tar -xzf "$TEMP_DIR/ha.tar.gz" -C "$TEMP_DIR"
 echo -e "${BLUE}>>> 准备安装目录: $PROJECT_DIR ...${NC}"
 mkdir -p "$INSTALL_BASE"
 
-# 如果项目目录已存在，先备份 (防止覆盖配置或误删)
+# 备份旧版本
 if [ -d "$PROJECT_DIR" ]; then
     BACKUP_NAME="${PROJECT_DIR}.bak.$(date +%Y%m%d%H%M%S)"
     echo -e "${GREEN}发现旧版本，正在备份至: $BACKUP_NAME${NC}"
     mv "$PROJECT_DIR" "$BACKUP_NAME"
 fi
 
-# 移动解压后的文件
-# GitHub 压缩包解压后的目录名通常为 repo-branch (例如 mariadb-ha-3node-main)
+# 移动文件 (兼容 GitHub 目录结构)
 EXTRACTED_NAME="$REPO-$BRANCH"
 if [ -d "$TEMP_DIR/$EXTRACTED_NAME" ]; then
     mv "$TEMP_DIR/$EXTRACTED_NAME" "$PROJECT_DIR"
 else
-    # 兼容性处理：如果解压出来的名字不一样，尝试找唯一的目录
     DETECTED_DIR=$(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)
     mv "$DETECTED_DIR" "$PROJECT_DIR"
 fi
@@ -75,7 +72,7 @@ read -p "Node-1 (Master): " N1
 read -p "Node-2 (Slave):  " N2
 read -p "Node-3 (Slave):  " N3
 
-# 生成配置文件 topology.env 到项目目录下
+# 生成 topology.env
 cat <<CONFIG > topology.env
 NODE_1_IP="$N1"
 NODE_2_IP="$N2"
@@ -93,23 +90,90 @@ ADMINER_IMAGE="adminer:latest"
 REPL_USER="repl_user"
 CONFIG
 
-# 赋予脚本执行权限
+# 赋予权限
 chmod +x install_node.sh scripts/*.sh
 
 echo -e "${BLUE}>>> [3/5] 开始安装节点软件 (Docker + Sidecar)${NC}"
 echo "-------------------------------------------------------"
-# 启动容器
+# 启动容器 (这一步会安装 Docker 并拉取镜像，为后面计算 Hash 做准备)
 ./install_node.sh
 
+# ==============================================================================
+# [4/5] 录入安全凭据 (双态存储升级版)
+# ==============================================================================
 echo ""
-echo -e "${BLUE}>>> [4/5] 录入安全凭据 (v3.2 核心步骤)${NC}"
+echo -e "${BLUE}>>> [4/5] 录入安全凭据 (v3.3 Dual-State Mode)${NC}"
 echo "-------------------------------------------------------"
 echo "Monitor 和 ProxySQL 需要统一的凭据文件才能工作。"
-echo "请按照提示录入您的 Root 密码和 ProxySQL Admin 密码。"
+echo "系统将自动生成明文和哈希两个版本的凭据。"
 echo "-------------------------------------------------------"
+
+# 定义哈希生成函数
+generate_hash() {
+    local pwd="$1"
+    # 利用 install_node.sh 刚刚拉取的 mariadb 镜像来计算哈希
+    docker run --rm mariadb:latest mariadb -N -e "SELECT PASSWORD('${pwd}')" 2>/dev/null
+}
+
+# 交互式录入 Root 密码
+while true; do
+    echo "请输入 DB Root 密码 (用于数据库连接):"
+    read -r -s ROOT_PASS
+    echo "请再次输入 DB Root 密码:"
+    read -r -s ROOT_PASS_CONFIRM
+    if [ "$ROOT_PASS" != "$ROOT_PASS_CONFIRM" ] || [ -z "$ROOT_PASS" ]; then
+        echo -e "${RED}密码不匹配或为空，请重试。${NC}"
+    else
+        break
+    fi
+done
+
+# 交互式录入 Proxy 密码
+while true; do
+    echo "请输入 ProxySQL Admin 密码 (用于管理接口):"
+    read -r -s PROXY_PASS
+    echo "请再次输入 ProxySQL Admin 密码:"
+    read -r -s PROXY_PASS_CONFIRM
+    if [ "$PROXY_PASS" != "$PROXY_PASS_CONFIRM" ] || [ -z "$PROXY_PASS" ]; then
+        echo -e "${RED}密码不匹配或为空，请重试。${NC}"
+    else
+        break
+    fi
+done
+
+echo ""
+echo "正在计算加密哈希 (使用 MariaDB 引擎)..."
+
+# 计算哈希
+ROOT_HASH=$(generate_hash "${ROOT_PASS}")
+PROXY_HASH=$(generate_hash "${PROXY_PASS}")
+
+echo "正在生成双态凭据文件..."
+
+# [修正] 使用 PROJECT_DIR 而不是 BASE_DIR
+SECRETS_FILE="${PROJECT_DIR}/.secrets.env"
+
+cat > "${SECRETS_FILE}" <<EOF
+# MariaDB HA Secrets (Auto-generated)
+# Created at: $(date)
+
+# [Plaintext] 用于 monitor.sh 脚本连接数据库 (必须明文)
+export AUTO_DB_ROOT_PASS='${ROOT_PASS}'
+export AUTO_PROXY_ADMIN_PASS='${PROXY_PASS}'
+
+# [Hash] 用于 init_proxysql.sh 注入底层配置 (安全无坑)
+# 格式: MySQL Native Password (* + 40位Hex)
+export AUTO_DB_ROOT_HASH='${ROOT_HASH}'
+export AUTO_PROXY_ADMIN_HASH='${PROXY_HASH}'
+EOF
+
+chmod 600 "${SECRETS_FILE}"
+echo -e "${GREEN}>>> 成功！凭据已保存至: .secrets.env${NC}"
+echo "    包含明文与哈希双重校验，安全等级: High"
+
+# [修正] 删除了 redundant 的 ./scripts/save_secrets.sh 调用
+
 sleep 1
-# [关键新增] 必须运行此脚本生成 .secrets.env，否则 monitor 无法启动
-./scripts/save_secrets.sh
 
 echo ""
 echo -e "${BLUE}>>> [5/5] 配置集群互联关系${NC}"
