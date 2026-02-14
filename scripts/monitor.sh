@@ -2,11 +2,13 @@
 set -u
 
 # ==============================================================================
-# MariaDB HA v3.2 - Auto Monitor (EnvVar Injection & MariaDB 11 Ready)
+# MariaDB HA v3.5 - Enterprise Auto Monitor (企业级动态哨兵)
 # ==============================================================================
-# 依赖: 必须先运行 scripts/save_secrets.sh 生成 .secrets.env
-# Fix 1: 使用 MYSQL_PWD 环境变量传递密码，完美支持 (*, #, @, !, \, ', ")
-# Fix 2: 适配 MariaDB 11+ (优先使用 mariadb-admin)
+# 核心特性:
+#   1. 动态寻主: 自动从 ProxySQL 读取当前 Master IP 进行监控。
+#   2. 确定性选举: 宕机后按优先级 (Node 1 > 2 > 3) 自动推举新 Master。
+#   3. 无限守护: 切换完成后不退出，继续监控新 Master。
+#   4. 抗干扰: 过滤 SSL 警告，完美兼容特殊字符密码。
 # ==============================================================================
 
 # 1. 基础配置
@@ -15,24 +17,11 @@ TOPOLOGY_FILE="${BASE_DIR}/topology.env"
 SECRET_FILE="${BASE_DIR}/.secrets.env"
 LOG_FILE="/var/log/ha-monitor.log"
 
-# 2. 加载拓扑配置
-if [ -f "$TOPOLOGY_FILE" ]; then 
-    source "$TOPOLOGY_FILE"
-else 
-    echo "Error: 找不到 topology.env"
-    exit 1
-fi
+# 2. 加载配置与凭据
+if [ -f "$TOPOLOGY_FILE" ]; then source "$TOPOLOGY_FILE"; else exit 1; fi
+if [ -f "$SECRET_FILE" ]; then source "$SECRET_FILE"; else exit 1; fi
 
-# 3. 加载加密凭据
-if [ -f "$SECRET_FILE" ]; then 
-    source "$SECRET_FILE"
-else 
-    echo "Error: 找不到 .secrets.env"
-    echo "请先运行 ./scripts/save_secrets.sh 输入密码！"
-    exit 1
-fi
-
-# 4. 参数设置
+# 3. 参数设置
 MAX_RETRIES=3
 CHECK_INTERVAL=5
 FAIL_COUNT=0
@@ -40,131 +29,134 @@ FAIL_COUNT=0
 # 日志函数
 log() { echo "[$(date '+%F %T')] $1" | tee -a "$LOG_FILE"; }
 
-# 5. 识别本机身份
+# 4. 识别本机身份与 IP
 LOCAL_IPS=$(hostname -I)
 MY_ROLE="UNKNOWN"
-if [[ "$LOCAL_IPS" == *"$NODE_1_IP"* ]]; then MY_ROLE="NODE_1"; fi
-if [[ "$LOCAL_IPS" == *"$NODE_2_IP"* ]]; then MY_ROLE="NODE_2"; fi
-if [[ "$LOCAL_IPS" == *"$NODE_3_IP"* ]]; then MY_ROLE="NODE_3"; fi
+MY_IP=""
+if [[ "$LOCAL_IPS" == *"$NODE_1_IP"* ]]; then MY_ROLE="NODE_1"; MY_IP="$NODE_1_IP"; fi
+if [[ "$LOCAL_IPS" == *"$NODE_2_IP"* ]]; then MY_ROLE="NODE_2"; MY_IP="$NODE_2_IP"; fi
+if [[ "$LOCAL_IPS" == *"$NODE_3_IP"* ]]; then MY_ROLE="NODE_3"; MY_IP="$NODE_3_IP"; fi
 
-log ">>> 哨兵启动 (Monitor v3.2-EnvVar)"
-log ">>> 监控目标: Node-1 ($NODE_1_IP)"
-log ">>> 本机角色: $MY_ROLE"
+log "=========================================================="
+log ">>> 哨兵启动 (Monitor v3.5 Enterprise)"
+log ">>> 本机角色: $MY_ROLE ($MY_IP)"
+log "=========================================================="
 
 # ==============================================================================
-# 辅助函数: 健康检查 (兼容性增强)
+# 辅助函数
 # ==============================================================================
-check_master_health() {
-    local target_ip=$1
-    # 这里的 monitor 用户密码通常较简单，且在 init 脚本中固定。
-    # 如果你也修改了 monitor 用户的密码为复杂密码，这里也需要用 MYSQL_PWD。
-    # 但按照标准流程，monitor_pass 是固定的简单密码，使用 -p 暂无风险。
-    # 为了极致稳健，我们尝试多种工具。
-    
-    # 方法 A: 尝试 mariadb-admin (MariaDB 11+ 标准工具)
-    if docker exec mariadb mariadb-admin -h "$target_ip" -u monitor -pmonitor_pass ping --connect-timeout=3 >/dev/null 2>&1; then
-        return 0
-    fi
-    
-    # 方法 B: 尝试 mysqladmin (旧版兼容)
-    if docker exec mariadb mysqladmin -h "$target_ip" -u monitor -pmonitor_pass ping --connect-timeout=3 >/dev/null 2>&1; then
-        return 0
-    fi
-    
-    # 方法 C: 尝试 SQL 简单查询 (最底层兜底，只要能连上就算活)
-    # 只要能执行 SQL，说明 mysqld 进程是活的
-    if docker exec mariadb mariadb -h "$target_ip" -u monitor -pmonitor_pass -e "DO 1;" --connect-timeout=3 >/dev/null 2>&1; then
-        return 0
-    fi
 
-    # 全部失败，判定为挂了
-    return 1
+# 从 ProxySQL 动态获取当前写库 (Master) 的 IP
+get_current_master() {
+    local master_ip
+    # 查询 HG 10，过滤 SSL 警告，提取纯 IP
+    master_ip=$(docker exec -e MYSQL_PWD="$AUTO_PROXY_ADMIN_PASS" proxysql mysql -u admin -h 127.0.0.1 -P 6032 -N -e "SELECT hostname FROM mysql_servers WHERE hostgroup_id=10 LIMIT 1;" 2>/dev/null | tail -n 1 | tr -d '\r' | tr -d ' ')
+    echo "$master_ip"
 }
 
-# ==============================================================================
-# 核心函数 (使用环境变量注入密码 - 核心修复)
-# ==============================================================================
+# 探测节点是否存活 (使用 Root 账号直连探测)
+check_node_health() {
+    local target_ip=$1
+    if docker exec -e MYSQL_PWD="$AUTO_DB_ROOT_PASS" mariadb mariadb -h "$target_ip" -uroot -N -e "DO 1;" --connect-timeout=3 >/dev/null 2>&1; then
+        return 0 # Alive
+    fi
+    return 1 # Dead
+}
 
-promote_db_to_master() {
-    log ">>> [DB Action] 正在停止复制并提升为主库..."
-    
-    # [FIX] 使用 -e MYSQL_PWD 传递 Root 密码
-    # 避免 CLI 参数解析问题 (如 # 被视为注释)
+# 提升本机为 Master
+promote_self_to_master() {
+    log ">>> [DB Action] 我是新任 Master！正在停止复制并解锁读写..."
     docker exec -e MYSQL_PWD="$AUTO_DB_ROOT_PASS" mariadb mariadb -uroot -e \
         "STOP SLAVE; RESET SLAVE ALL; SET GLOBAL read_only=0;" >> "$LOG_FILE" 2>&1
-        
     if [ $? -eq 0 ]; then
-        log ">>> [Success] 数据库已成功提升为 Master！"
+        log ">>> [Success] 数据库提升成功！"
     else
-        log ">>> [Error] 数据库提升失败，请检查密码或容器日志。"
+        log ">>> [Error] 数据库提升失败！"
     fi
 }
 
+# 切换本地 ProxySQL 路由
 switch_proxysql_routing() {
     local new_writer_ip=$1
-    log ">>> [ProxySQL Action] 将写流量 (HG 10) 切换至: $new_writer_ip"
-
-    # [FIX] 使用 -e MYSQL_PWD 传递 Admin 密码
-    # 这是处理特殊字符最关键的地方。MYSQL_PWD 环境变量会被 mysql 客户端直接读取，
-    # 绕过了 Shell 的参数解析层，因此支持 #, *, ', " 等任意字符。
+    log ">>> [ProxySQL Action] 更新本地路由表 (HG 10) 指向: $new_writer_ip"
     docker exec -e MYSQL_PWD="$AUTO_PROXY_ADMIN_PASS" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL >> "$LOG_FILE" 2>&1
-        -- 1. 删除旧的 Writer
         DELETE FROM mysql_servers WHERE hostgroup_id=10;
-        
-        -- 2. 插入新的 Writer
         INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (10, '$new_writer_ip', 3306);
-        
-        -- 3. 生效
         LOAD MYSQL SERVERS TO RUNTIME;
         SAVE MYSQL SERVERS TO DISK;
 SQL
-    
-    # 检查退出码
-    if [ $? -eq 0 ]; then
-        log ">>> [Success] 本地 ProxySQL 路由已更新。"
-    else
-        log ">>> [Error] ProxySQL 更新失败 (Access Denied 或 容器未运行)。"
-        log ">>> 请检查 .secrets.env 中的密码是否与 ProxySQL 实际密码一致。"
-    fi
+    log ">>> [Success] 本地 ProxySQL 路由已刷新。"
 }
 
 # ==============================================================================
-# 主循环
+# 主循环 (无限守护)
 # ==============================================================================
 
 while true; do
-    if [ "$MY_ROLE" == "NODE_1" ]; then sleep 60; continue; fi
+    # 1. 动态获取当前 Master
+    CURRENT_MASTER=$(get_current_master)
+    
+    if [ -z "$CURRENT_MASTER" ]; then
+        log "[Warn] 无法从 ProxySQL 读取当前 Master，可能 ProxySQL 尚未就绪，重试中..."
+        sleep $CHECK_INTERVAL
+        continue
+    fi
 
-    # 调用兼容性检测函数
-    if check_master_health "$NODE_1_IP"; then
+    # 2. 检查当前 Master 是否存活
+    if check_node_health "$CURRENT_MASTER"; then
         # === Master 活着 ===
         if [ $FAIL_COUNT -gt 0 ]; then
-            log "Master ($NODE_1_IP) 恢复正常。"
+            log "[Recover] 监控目标 ($CURRENT_MASTER) 恢复正常。"
+            FAIL_COUNT=0
         fi
-        FAIL_COUNT=0
     else
         # === Master 连不上 ===
         FAIL_COUNT=$((FAIL_COUNT+1))
-        log "[Alert] 连接 Master 失败! ($FAIL_COUNT/$MAX_RETRIES)"
+        log "[Alert] 目标 $CURRENT_MASTER 连接失败! ($FAIL_COUNT/$MAX_RETRIES)"
 
+        # 达到最大重试次数，触发故障转移
         if [ $FAIL_COUNT -ge $MAX_RETRIES ]; then
-            log "!!! [CRITICAL] 判定 Master (Node-1) 已宕机 !!!"
-            log "!!! 启动故障转移程序 !!!"
+            log "!!! [CRITICAL] 判定当前 Master ($CURRENT_MASTER) 已宕机 !!!"
+            log "!!! 启动自动选举与故障转移程序 !!!"
             
-            # 1. 数据库层切换 (仅 Node-2 执行，避免 Node-2 和 Node-3 同时抢主)
-            if [ "$MY_ROLE" == "NODE_2" ]; then
-                promote_db_to_master
+            # 选举逻辑: 按节点优先级 (Node 1 > 2 > 3) 寻找活着的节点
+            NEW_MASTER=""
+            for ip in "$NODE_1_IP" "$NODE_2_IP" "$NODE_3_IP"; do
+                # 排除死掉的前任
+                if [ "$ip" == "$CURRENT_MASTER" ] || [ -z "$ip" ]; then continue; fi
+                
+                if check_node_health "$ip"; then
+                    NEW_MASTER="$ip"
+                    break # 找到最高优先级的存活节点，立刻停止选举
+                fi
+            done
+
+            if [ -z "$NEW_MASTER" ]; then
+                log "[Fatal] 所有备用节点均无法连接！集群完全瘫痪！"
+                FAIL_COUNT=0
+                sleep 10
+                continue
             fi
 
-            # 2. 路由层切换 (Node-2 & Node-3 都要执行，因为每个节点都有 ProxySQL)
-            switch_proxysql_routing "$NODE_2_IP"
+            log ">>> 选举结果: 新 Master 是 $NEW_MASTER"
 
-            log ">>> 故障转移完成。Writer 已指向 Node-2 ($NODE_2_IP)。"
+            # 执行转移步骤 A: 如果自己被选为主，则提升自己
+            if [ "$MY_IP" == "$NEW_MASTER" ]; then
+                promote_self_to_master
+            fi
+
+            # 执行转移步骤 B: 所有人更新自己的 ProxySQL
+            switch_proxysql_routing "$NEW_MASTER"
             
-            # 故障转移是一次性的，完成后退出脚本，等待人工介入修复原 Master
-            exit 0
+            log ">>> 故障转移完成！集群现由 $NEW_MASTER 接管。"
+            
+            # 重置计数器，下一轮循环将自动监控新 Master (无限守护)
+            FAIL_COUNT=0
+            log ">>> 哨兵重置，开始监控新目标..."
+            sleep 3
         fi
     fi
 
+    # 休息一下进入下一轮探测
     sleep $CHECK_INTERVAL
 done
