@@ -2,12 +2,13 @@
 set -u
 
 # ==============================================================================
-# MariaDB HA v3.4 - Auto Rejoin Script (智能全自动版)
+# MariaDB HA v3.4.1 - Auto Rejoin Script (智能全自动修复版)
 # ==============================================================================
 # 核心升级:
 #   1. 自动启动 MariaDB 容器 (解决 "未找到 Master" 报错)
 #   2. 自动读取复制密码 (实现无人值守)
 #   3. 自动修正 ProxySQL 路由表
+#   4. [核心修复] 过滤 MariaDB 客户端 SSL 警告，兼容返回值为 0 或 OFF 的探测逻辑
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,7 +26,7 @@ ok() { echo -e "${GREEN}[OK]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 echo "----------------------------------------------------------"
-echo ">>> MariaDB HA 节点归队程序 (v3.4 Auto)"
+echo ">>> MariaDB HA 节点归队程序 (v3.4.1 Auto)"
 echo "----------------------------------------------------------"
 
 # ==============================================================================
@@ -50,7 +51,6 @@ if [ -f "${SECRETS_FILE}" ]; then
     PROXY_ADMIN_PASS="${AUTO_PROXY_ADMIN_PASS}"
     
     # [v3.4 新增] 自动读取复制密码
-    # 如果 bootstrap.sh 是旧版本，这里可能为空
     REPL_PASS="${AUTO_REPL_PASS:-}"
 else
     err "未找到 .secrets.env 文件！无法自动操作。"
@@ -78,13 +78,14 @@ check_if_master() {
     if [[ "$local_ips" == *"$target_ip"* ]]; then return 1; fi
 
     # 远程探测: 必须是 Read_Only=OFF 才是 Master
+    # [v3.4.1 修复] 使用 tail -n 1 过滤 SSL 警告，并清理回车和空格字符
     local is_ro
-    if is_ro=$(docker exec -e MYSQL_PWD="${DB_ROOT_PASS}" mariadb mariadb -uroot -h "$target_ip" -N -e "SELECT @@read_only;" 2>/dev/null); then
-        # 0 = OFF (Master), 1 = ON (Slave)
-        if [ "$is_ro" == "0" ]; then
-            echo "$target_ip"
-            return 0
-        fi
+    is_ro=$(docker exec -e MYSQL_PWD="${DB_ROOT_PASS}" mariadb mariadb -uroot -h "$target_ip" -N -e "SELECT @@read_only;" 2>/dev/null | tail -n 1 | tr -d '\r' | tr -d ' ')
+
+    # 0 = OFF (Master), 1 = ON (Slave)，兼容最新版镜像返回的字符串 OFF
+    if [ "$is_ro" == "0" ] || [ "${is_ro^^}" == "OFF" ]; then
+        echo "$target_ip"
+        return 0
     fi
     return 1
 }
