@@ -2,7 +2,7 @@
 set -e
 
 # ==============================================================================
-# MariaDB HA v3.2 - Node Installer (Docker Compose + NAT Support)
+# MariaDB HA v4.0 - Node Installer (Docker Compose + NAT Support + 静默版)
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +16,7 @@ NC='\033[0m'
 WARN='\033[1;33m'
 
 echo "=========================================================="
-echo " 正在识别节点身份..."
+echo " 正在识别节点身份并配置环境..."
 echo "=========================================================="
 
 # 1. 角色识别 (Identity Check)
@@ -65,31 +65,24 @@ echo -e " 节点角色: ${GREEN}${MY_ROLE}${NC}"
 echo -e " 节点 IP:  ${GREEN}${MY_IP}${NC} (ServerID: ${MY_ID})"
 echo "----------------------------------------------------------"
 
-# 2. 安全交互：获取密码
+# 2. 静默获取密码 (v4.0 核心)
 # ------------------------------------------------------------------------------
-echo ">>> 请输入集群密码 (输入不显示)"
-echo "----------------------------------------------------------"
+if [ -f "${BASE_DIR}/.secrets.env" ]; then
+    source "${BASE_DIR}/.secrets.env"
+else
+    echo -e "${RED}[ERROR] 未找到 .secrets.env，凭据传递失败！请先运行 bootstrap.sh${NC}"
+    exit 1
+fi
 
-# [修复] 移除制表符，修复光标错位
-read -s -p "1. 输入 Root 密码 (DB_ROOT_PASS): " DB_ROOT_PASS < /dev/tty
-echo ""
-if [ -z "$DB_ROOT_PASS" ]; then echo "密码不能为空"; exit 1; fi
-
-read -s -p "2. 输入 ProxySQL Admin 密码: " PROXY_ADMIN_PASS < /dev/tty
-echo ""
-if [ -z "$PROXY_ADMIN_PASS" ]; then echo "密码不能为空"; exit 1; fi
-
-echo "----------------------------------------------------------"
-echo -e "${BLUE}[INFO] 密码已读入内存，准备部署...${NC}"
-
-# 3. 生成 docker-compose.yml
-# ------------------------------------------------------------------------------
-# 导出变量供 compose 使用
-export DB_ROOT_PASS
-export PROXY_ADMIN_PASS
+export DB_ROOT_PASS="${AUTO_DB_ROOT_PASS}"
+export PROXY_ADMIN_PASS="${AUTO_PROXY_ADMIN_PASS}"
 export MY_ID
 export MY_IP
 
+echo -e "${BLUE}[INFO] 核心凭据已静默加载，准备部署容器组...${NC}"
+
+# 3. 生成 docker-compose.yml
+# ------------------------------------------------------------------------------
 cat <<YAML > docker-compose.yml
 services:
   mariadb:
@@ -121,8 +114,6 @@ services:
       - mariadb
     volumes:
       - proxysql_data:/var/lib/proxysql
-    # 在 compose 中，我们主要通过 init_proxysql.sh 来配置，
-    # 但这里传递基本变量用于首次启动（如果镜像支持）
     environment:
       DB_cluster_nodes: "${NODE_1_IP},${NODE_2_IP},${NODE_3_IP}"
 
@@ -148,7 +139,7 @@ docker compose down >/dev/null 2>&1 || true
 docker compose up -d
 
 echo ""
-echo -e "${GREEN}[INFO] v3.2 (Sidecar模式) 安装完成！${NC}"
+echo -e "${GREEN}[INFO] v4.0 (Sidecar模式) 安装完成！${NC}"
 echo "----------------------------------------------------------"
 echo " [业务接入指南] 请在您的应用程序中使用以下配置:"
 echo "   Host: 127.0.0.1 (或本机内网IP)"
