@@ -2,20 +2,24 @@
 set -u
 
 # ==============================================================================
-# MariaDB HA v3.4.1 - Auto Rejoin Script (智能全自动修复版)
+# MariaDB HA v4.0 - 节点智能归队程序 (Auto-Rejoin 终极版)
 # ==============================================================================
 # 核心升级:
-#   1. 自动启动 MariaDB 容器 (解决 "未找到 Master" 报错)
-#   2. 自动读取复制密码 (实现无人值守)
-#   3. 自动修正 ProxySQL 路由表
-#   4. [核心修复] 过滤 MariaDB 客户端 SSL 警告，兼容返回值为 0 或 OFF 的探测逻辑
+#   1. 智能冷启动探测：取代死板 sleep，确保容器内部 mysqld 就绪后再执行 SQL。
+#   2. 绝对路径自适应：完美支持 Systemd 开机自启环境。
+#   3. 全量凭据静默流转：支持复杂密码转义与 SSL 警告过滤。
+#   4. 哨兵守护：配合 KillMode=process 确保归队后监控进程持续运行。
 # ==============================================================================
 
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "${BASE_DIR}/topology.env"
+# 自动获取脚本绝对路径，确保 Systemd 环境下能定位到同级脚本
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# 加载配置
+if [ -f "${BASE_DIR}/topology.env" ]; then source "${BASE_DIR}/topology.env"; fi
 SECRETS_FILE="${BASE_DIR}/.secrets.env"
 
-# 颜色
+# 颜色定义
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 RED='\033[0;31m'
@@ -26,156 +30,122 @@ ok() { echo -e "${GREEN}[OK]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 echo "----------------------------------------------------------"
-echo ">>> MariaDB HA 节点归队程序 (v3.4.1 Auto)"
+echo -e "${BLUE}>>> MariaDB HA 节点归队程序 (v4.0 Auto-Pilot)${NC}"
 echo "----------------------------------------------------------"
 
 # ==============================================================================
-# 1. 自动环境修复 (关键步骤)
+# 1. 自动环境修复与智能就绪探测
 # ==============================================================================
-# 检查 MariaDB 是否运行。如果宕机后容器是 Stop 状态，必须先启动才能探测。
+# 检查容器状态
 if [ "$(docker inspect -f '{{.State.Running}}' mariadb 2>/dev/null)" != "true" ]; then
     log "检测到 MariaDB 容器未运行，正在执行自动启动..."
     docker start mariadb
-    log "等待数据库冷启动就绪 (10s)..."
-    sleep 10
-else
-    log "MariaDB 容器运行正常。"
 fi
 
-# ==============================================================================
-# 2. 加载全量凭据
-# ==============================================================================
+# 加载凭据用于探测
 if [ -f "${SECRETS_FILE}" ]; then
     source "${SECRETS_FILE}"
-    DB_ROOT_PASS="${AUTO_DB_ROOT_PASS}"
-    PROXY_ADMIN_PASS="${AUTO_PROXY_ADMIN_PASS}"
-    
-    # [v3.4 新增] 自动读取复制密码
-    REPL_PASS="${AUTO_REPL_PASS:-}"
 else
-    err "未找到 .secrets.env 文件！无法自动操作。"
+    err "未找到 .secrets.env 文件！无法执行静默归队。"
 fi
 
-# 兼容性兜底: 如果是从旧版升级上来，文件里没存 REPL_PASS，则回退到手动输入
-if [ -z "${REPL_PASS:-}" ]; then
-    echo -e "${RED}[WARN] .secrets.env 中未找到 AUTO_REPL_PASS。${NC}"
-    echo "请输入复制用户 (repl_user) 的密码:"
-    read -r -s REPL_PASS
-    echo ""
+log "正在等待 MariaDB 内部 SQL 服务就绪..."
+DB_READY=false
+for i in {1..30}; do
+    # 探测本地数据库是否响应，同时过滤掉可能的客户端 SSL 警告
+    if docker exec -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -uroot -e "SELECT 1;" >/dev/null 2>&1; then
+        DB_READY=true
+        ok "MariaDB 内部服务已就绪。"
+        break
+    fi
+    sleep 2
+done
+
+if [ "$DB_READY" = false ]; then
+    err "等待超时！MariaDB 容器启动后无法在 60s 内响应 SQL 请求。"
 fi
 
 # ==============================================================================
-# 3. 扫描集群寻找新 Master
+# 2. 扫描集群寻找当前真 Master (分布式寻主)
 # ==============================================================================
-log "正在扫描集群寻找当前 Master..."
+log "正在扫描集群寻找当前活跃 Master..."
 NEW_MASTER_IP=""
 
-check_if_master() {
-    local target_ip=$1
-    local local_ips=$(hostname -I)
-    
-    # 跳过本机
-    if [[ "$local_ips" == *"$target_ip"* ]]; then return 1; fi
-
-    # 远程探测: 必须是 Read_Only=OFF 才是 Master
-    # [v3.4.1 修复] 使用 tail -n 1 过滤 SSL 警告，并清理回车和空格字符
-    local is_ro
-    is_ro=$(docker exec -e MYSQL_PWD="${DB_ROOT_PASS}" mariadb mariadb -uroot -h "$target_ip" -N -e "SELECT @@read_only;" 2>/dev/null | tail -n 1 | tr -d '\r' | tr -d ' ')
-
-    # 0 = OFF (Master), 1 = ON (Slave)，兼容最新版镜像返回的字符串 OFF
-    if [ "$is_ro" == "0" ] || [ "${is_ro^^}" == "OFF" ]; then
-        echo "$target_ip"
-        return 0
-    fi
-    return 1
-}
-
-# 遍历拓扑中的所有 IP
 for IP in "$NODE_1_IP" "$NODE_2_IP" "$NODE_3_IP"; do
-    if [ -n "$IP" ]; then
-        if FOUND_IP=$(check_if_master "$IP"); then
-            NEW_MASTER_IP="$FOUND_IP"
-            break
-        fi
+    # 跳过本机 IP
+    if [[ "$(hostname -I)" == *"$IP"* ]]; then continue; fi
+    
+    # 远程探测 Master (read_only 必须为 0 或 OFF)
+    # tr 清理不可见字符，tail 过滤 SSL 警告
+    is_ro=$(docker exec -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -uroot -h "$IP" -N -e "SELECT @@read_only;" 2>/dev/null | tail -n 1 | tr -d '\r' | tr -d ' ')
+    
+    if [ "$is_ro" == "0" ] || [ "${is_ro^^}" == "OFF" ]; then
+        NEW_MASTER_IP="$IP"
+        break
     fi
 done
 
 if [ -z "${NEW_MASTER_IP}" ]; then
-    err "扫描失败！未找到任何在线的 Master 节点。\n可能原因: 集群全挂了，或者网络不通，或者目标 Master 也是 read_only=ON。"
-else
-    ok "发现新 Master: ${NEW_MASTER_IP}"
+    err "归队中止：集群中未发现可写状态 (read_only=OFF) 的 Master 节点。"
 fi
-
-echo "----------------------------------------------------------"
-log "即将在本机执行归队操作..."
-log "1. 停止 Slave 进程 & 重置状态"
-log "2. 指向新 Master: ${NEW_MASTER_IP}"
-log "3. 修正 ProxySQL 路由"
-log "4. 重启监控哨兵"
-echo "----------------------------------------------------------"
+ok "发现当前集群 Master: ${NEW_MASTER_IP}"
 
 # ==============================================================================
-# 4. 数据库层归队 (MariaDB)
+# 3. 执行归队：重置复制、修正路由、重启哨兵
 # ==============================================================================
-log "正在配置 MariaDB 复制..."
+echo "----------------------------------------------------------"
+log "即将在本机执行自愈操作..."
+log "1. 停止 Slave 进程并重置拓扑记忆"
+log "2. 指向活跃 Master: ${NEW_MASTER_IP}"
+log "3. 强制同步本地 ProxySQL 路由表"
+log "4. 在后台拉起监控哨兵"
+echo "----------------------------------------------------------"
 
-# 停止复制，重置状态
-docker exec -e MYSQL_PWD="${DB_ROOT_PASS}" mariadb mariadb -uroot -e "STOP SLAVE; RESET SLAVE ALL;"
+log "正在配置 MariaDB 复制关系..."
+# 复杂密码转义处理
+SAFE_REPL_PASS="${AUTO_REPL_PASS//\\/\\\\}"
+SAFE_REPL_PASS="${SAFE_REPL_PASS//\'/\\\'}"
 
-# 配置新主库 (使用 GTID 自动定位)
-CHANGE_SQL="CHANGE MASTER TO 
-  MASTER_HOST='${NEW_MASTER_IP}', 
-  MASTER_PORT=${DB_PORT}, 
-  MASTER_USER='${REPL_USER}', 
-  MASTER_PASSWORD='${REPL_PASS}', 
-  MASTER_USE_GTID=slave_pos; 
-START SLAVE;"
+docker exec -i -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -uroot <<-EOSQL
+    STOP SLAVE;
+    RESET SLAVE ALL;
+    CHANGE MASTER TO 
+        MASTER_HOST='${NEW_MASTER_IP}', 
+        MASTER_PORT=${DB_PORT}, 
+        MASTER_USER='${REPL_USER}', 
+        MASTER_PASSWORD='${SAFE_REPL_PASS}', 
+        MASTER_USE_GTID=slave_pos;
+    START SLAVE;
+    SET GLOBAL read_only=ON;
+EOSQL
 
-docker exec -e MYSQL_PWD="${DB_ROOT_PASS}" mariadb mariadb -uroot -e "${CHANGE_SQL}"
-
-# 验证状态
 sleep 2
-SLAVE_STATUS=$(docker exec -e MYSQL_PWD="${DB_ROOT_PASS}" mariadb mariadb -uroot -e "SHOW SLAVE STATUS\G")
-IO_RUNNING=$(echo "$SLAVE_STATUS" | grep "Slave_IO_Running:" | awk '{print $2}')
+# 验证 IO 线程状态
+IO_STATUS=$(docker exec -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -uroot -e "SHOW SLAVE STATUS\G" | grep "Slave_IO_Running:" | awk '{print $2}' | tr -d '\r')
 
-if [ "$IO_RUNNING" == "Yes" ]; then
-    ok "MariaDB 复制已启动 (IO: Yes)"
-    # 强制设为只读 (防止双写)
-    docker exec -e MYSQL_PWD="${DB_ROOT_PASS}" mariadb mariadb -uroot -e "SET GLOBAL read_only=ON;"
+if [ "$IO_STATUS" == "Yes" ]; then
+    ok "MariaDB 复制链路已成功建立。"
 else
-    err "MariaDB 复制启动失败！请检查日志。"
+    err "复制建立失败！请手动检查网络连接或 Master 复制账号权限。"
 fi
 
-# ==============================================================================
-# 5. 流量层归队 (ProxySQL)
-# ==============================================================================
-log "正在修正 ProxySQL 路由..."
-
-# 修正路由表：将 HG 10 (写) 指向新 Master，将 HG 20 (读) 包含所有节点
-# 注意：这里会清空 HG10 并重新指向新主，这是最安全的做法
-docker exec -i -e MYSQL_PWD="${PROXY_ADMIN_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-EOF
+log "正在同步本地 ProxySQL 路由规则..."
+docker exec -i -e MYSQL_PWD="${AUTO_PROXY_ADMIN_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL
     DELETE FROM mysql_servers WHERE hostgroup_id=10;
     INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (10, '${NEW_MASTER_IP}', 3306);
-    
     REPLACE INTO mysql_servers (hostgroup_id, hostname, port) VALUES (20, '${NODE_1_IP}', 3306);
     REPLACE INTO mysql_servers (hostgroup_id, hostname, port) VALUES (20, '${NODE_2_IP}', 3306);
     REPLACE INTO mysql_servers (hostgroup_id, hostname, port) VALUES (20, '${NODE_3_IP}', 3306);
-    
     LOAD MYSQL SERVERS TO RUNTIME;
     SAVE MYSQL SERVERS TO DISK;
-EOF
+SQL
+ok "ProxySQL 路由已修正：写流量 -> ${NEW_MASTER_IP}"
 
-ok "ProxySQL 路由表已更新 (Writer -> ${NEW_MASTER_IP})"
-
-# ==============================================================================
-# 6. 重启监控
-# ==============================================================================
-log "重启 HA Monitor..."
-# 杀死旧的监控进程 (防止多开)
+log "正在激活后台监控哨兵..."
 pkill -f monitor.sh || true
-# 后台启动新监控
-nohup "${BASE_DIR}/scripts/monitor.sh" > /var/log/ha-monitor.log 2>&1 &
+# 使用绝对路径启动，确保在开机引导环境下的稳定性
+nohup "${SCRIPT_DIR}/monitor.sh" > /var/log/ha-monitor.log 2>&1 &
 
 echo "----------------------------------------------------------"
-ok "✅ 归队完成！本机已作为 Slave 加入集群，并开始监控 Master。"
+ok "✅ 归队完成！本机状态已恢复，哨兵已开始监控 Master 节点。"
 echo "----------------------------------------------------------"

@@ -2,12 +2,13 @@
 set -e
 
 # ==============================================================================
-# MariaDB HA v4.0 - Bootstrap (Auto-Pilot 流水线安装器)
+# MariaDB HA v4.0.0 - Bootstrap (Auto-Pilot 流水线安装器)
 # ==============================================================================
 # 架构变更:
 #   1. [New] 升级至 v4.0 一键全自动流水线部署，告别繁琐的手动步骤。
 #   2. [Fix] 使用 OpenSSL 本地计算哈希，彻底解决 Docker 容器启动失败导致的中断问题。
 #   3. [New] 在安装阶段录入 REPL_PASS 并持久化，支持全链条静默执行。
+#   4. [New] 植入 Systemd 开机自愈拦截器，彻底杜绝物理机重启导致的短暂脑裂。
 # ==============================================================================
 
 # 配置
@@ -141,10 +142,8 @@ generate_hash() {
 
 # 1. Root 密码
 while true; do
-    echo "请输入 DB Root 密码 (用于数据库连接):"
-    read -r -s ROOT_PASS
-    echo "请再次输入 DB Root 密码:"
-    read -r -s ROOT_PASS_CONFIRM
+    read -r -s -p "请输入 DB Root 密码 (用于数据库连接): " ROOT_PASS < /dev/tty; echo ""
+    read -r -s -p "请再次输入 DB Root 密码: " ROOT_PASS_CONFIRM < /dev/tty; echo ""
     if [ "$ROOT_PASS" != "$ROOT_PASS_CONFIRM" ] || [ -z "$ROOT_PASS" ]; then
         echo -e "${RED}密码不匹配或为空，请重试。${NC}"
     else
@@ -154,10 +153,8 @@ done
 
 # 2. Proxy Admin 密码
 while true; do
-    echo "请输入 ProxySQL Admin 密码 (用于管理接口):"
-    read -r -s PROXY_PASS
-    echo "请再次输入 ProxySQL Admin 密码:"
-    read -r -s PROXY_PASS_CONFIRM
+    read -r -s -p "请输入 ProxySQL Admin 密码 (用于管理接口): " PROXY_PASS < /dev/tty; echo ""
+    read -r -s -p "请再次输入 ProxySQL Admin 密码: " PROXY_PASS_CONFIRM < /dev/tty; echo ""
     if [ "$PROXY_PASS" != "$PROXY_PASS_CONFIRM" ] || [ -z "$PROXY_PASS" ]; then
         echo -e "${RED}密码不匹配或为空，请重试。${NC}"
     else
@@ -167,10 +164,8 @@ done
 
 # 3. Replication 密码
 while true; do
-    echo "请输入 Replication 复制密码 (用于节点间同步):"
-    read -r -s REPL_PASS
-    echo "请再次输入 Replication 复制密码:"
-    read -r -s REPL_PASS_CONFIRM
+    read -r -s -p "请输入 Replication 复制密码 (用于节点间同步): " REPL_PASS < /dev/tty; echo ""
+    read -r -s -p "请再次输入 Replication 复制密码: " REPL_PASS_CONFIRM < /dev/tty; echo ""
     if [ "$REPL_PASS" != "$REPL_PASS_CONFIRM" ] || [ -z "$REPL_PASS" ]; then
         echo -e "${RED}密码不匹配或为空，请重试。${NC}"
     else
@@ -195,7 +190,7 @@ fi
 SECRETS_FILE="${PROJECT_DIR}/.secrets.env"
 
 cat > "${SECRETS_FILE}" <<SEC
-# MariaDB HA Secrets (Auto-generated v4.0)
+# MariaDB HA Secrets (Auto-generated v4.0.0)
 # Created at: $(date)
 
 # [Plaintext] 用于 monitor.sh 和 rejoin.sh
@@ -223,7 +218,7 @@ echo "-------------------------------------------------------"
 # [6/6] 全自动流水线 (Auto-Pilot)
 # ==============================================================================
 echo ""
-echo -e "${BLUE}>>> [6/6] 执行流水线: 自动建主从 -> 刷路由 -> 挂哨兵${NC}"
+echo -e "${BLUE}>>> [6/6] 执行流水线: 自动建主从 -> 刷路由 -> 挂哨兵 -> 植入免疫抗体${NC}"
 echo "-------------------------------------------------------"
 
 # 1. 自动配置复制关系 (透传角色，免去子脚本二次检测和询问)
@@ -239,16 +234,53 @@ pkill -f monitor.sh || true
 nohup ./scripts/monitor.sh > /var/log/ha-monitor.log 2>&1 &
 sleep 2
 
+# ==============================================================================
+# 终极防御：植入 Systemd 开机自愈拦截器 (防脑裂)
+# ==============================================================================
+echo -e "${BLUE}[INFO] 正在植入底层防御：系统开机自愈服务 (Systemd)...${NC}"
+cat << 'EOF' > /etc/systemd/system/mariadb-ha-boot.service
+[Unit]
+Description=MariaDB HA Boot Interceptor & Auto-Rejoin
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+# [修复 1] 注入完整的环境变量，确保能找到 docker 和其他基础命令
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# [修复 2] 动态等待，直到 docker 引擎真正响应为止，再额外留 10 秒给容器启动
+ExecStartPre=/bin/sh -c 'while ! docker info >/dev/null 2>&1; do sleep 1; done; sleep 10'
+
+# 执行核心归队逻辑
+ExecStart=/opt/docker/mariadb-ha-3node/scripts/rejoin.sh
+
+StandardOutput=append:/var/log/ha-boot-rejoin.log
+StandardError=append:/var/log/ha-boot-rejoin.log
+
+# [修复 3 核心] 告诉 Systemd：脚本执行完就拉倒，绝对不要去杀它留在后台的 monitor.sh！
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable mariadb-ha-boot.service >/dev/null 2>&1
+echo -e "${GREEN}[OK] 开机防脑裂疫苗注射完毕！${NC}"
+
 echo ""
 echo -e "${GREEN}=======================================================${NC}"
-echo -e "${GREEN}🎉 部署全部完成！真正的一键流水线 (v4.0)${NC}"
+echo -e "${GREEN}🎉 部署全部完成！真正的一键流水线 (v4.0 终极版)${NC}"
 echo -e "${GREEN}=======================================================${NC}"
 echo -e " ✅ 基础容器已启动 (MariaDB + ProxySQL + Adminer)"
 echo -e " ✅ 主从复制已自动建立并校验成功"
 echo -e " ✅ 读写分离路由规则已注入"
 echo -e " ✅ 高可用监控哨兵已在后台守护"
+echo -e " 🛡️  开机自愈防御系统已植入系统底层 (Systemd)"
 echo -e "-------------------------------------------------------"
 echo -e " 🚀 业务接入入口: ${GREEN}127.0.0.1:6033${NC} (或本机内网IP:6033)"
 echo -e " 👁️  查看哨兵日志: ${BLUE}tail -f /var/log/ha-monitor.log${NC}"
+echo -e " 👁️  查看开机自愈日志: ${BLUE}cat /var/log/ha-boot-rejoin.log${NC}"
 echo -e "-------------------------------------------------------"
 echo -e " [项目路径]: ${PROJECT_DIR}"
