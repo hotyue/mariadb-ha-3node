@@ -43,7 +43,7 @@
 
 ### 2. 一键安装 (在三台机器上分别执行)
 ```bash
-curl -fsSL [https://raw.githubusercontent.com/hotyue/mariadb-ha-3node/main/scripts/bootstrap.sh](https://raw.githubusercontent.com/hotyue/mariadb-ha-3node/main/scripts/bootstrap.sh) -o bootstrap.sh && chmod +x bootstrap.sh && ./bootstrap.sh
+curl -fsSL https://raw.githubusercontent.com/hotyue/mariadb-ha-3node/main/scripts/bootstrap.sh -o bootstrap.sh && chmod +x bootstrap.sh && ./bootstrap.sh
 ```
 
 交互提示时：第一台机器选择 MASTER，后两台机器选择 SLAVE。请牢记输入的三个密码。
