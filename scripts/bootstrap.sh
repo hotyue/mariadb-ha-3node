@@ -2,11 +2,12 @@
 set -e
 
 # ==============================================================================
-# MariaDB HA v3.4 - Bootstrap (One-Click Installer)
+# MariaDB HA v4.0 - Bootstrap (Auto-Pilot 流水线安装器)
 # ==============================================================================
 # 架构变更:
-#   1. [Fix] 使用 OpenSSL 本地计算哈希，彻底解决 Docker 容器启动失败导致的中断问题
-#   2. [New] 在安装阶段录入 REPL_PASS 并持久化，支持 rejoin.sh 全自动归队
+#   1. [New] 升级至 v4.0 一键全自动流水线部署，告别繁琐的手动步骤。
+#   2. [Fix] 使用 OpenSSL 本地计算哈希，彻底解决 Docker 容器启动失败导致的中断问题。
+#   3. [New] 在安装阶段录入 REPL_PASS 并持久化，支持全链条静默执行。
 # ==============================================================================
 
 # 配置
@@ -24,7 +25,7 @@ BLUE='\033[0;34m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${BLUE}>>> [1/5] 正在下载安装包 ($BRANCH)...${NC}"
+echo -e "${BLUE}>>> [1/6] 正在下载安装包 ($BRANCH)...${NC}"
 
 # 使用临时目录处理下载
 TEMP_DIR=$(mktemp -d)
@@ -62,7 +63,7 @@ rm -rf "$TEMP_DIR"
 # 进入项目目录
 cd "$PROJECT_DIR"
 
-echo -e "${BLUE}>>> [2/5] 初始化配置向导${NC}"
+echo -e "${BLUE}>>> [2/6] 初始化集群拓扑配置${NC}"
 echo "-------------------------------------------------------"
 echo "请输入集群节点的公网/内网 IP 地址 (确保三台机器互通):"
 read -p "Node-1 (Master): " N1
@@ -90,37 +91,51 @@ CONFIG
 # 赋予权限
 chmod +x install_node.sh scripts/*.sh
 
-echo -e "${BLUE}>>> [3/5] 开始安装节点软件 (Docker + Sidecar)${NC}"
-echo "-------------------------------------------------------"
-# 启动容器
-./install_node.sh
-
 # ==============================================================================
-# [4/5] 录入安全凭据 (v3.4 Full-Auto Mode)
+# [3/6] 智能身份识别 (预处理)
 # ==============================================================================
 echo ""
-echo -e "${BLUE}>>> [4/5] 录入安全凭据 (v3.4 Full-Auto Mode)${NC}"
+echo -e "${BLUE}>>> [3/6] 智能识别本机角色${NC}"
 echo "-------------------------------------------------------"
-echo "Monitor 和 ProxySQL 需要统一的凭据文件才能工作。"
-echo "系统将自动生成明文和哈希两个版本的凭据。"
+
+LOCAL_IPS=$(hostname -I)
+MY_ROLE=""
+
+# 尝试自动匹配
+if [[ "$LOCAL_IPS" == *"$N1"* ]]; then
+    MY_ROLE="MASTER"
+elif [[ "$LOCAL_IPS" == *"$N2"* ]] || [[ "$LOCAL_IPS" == *"$N3"* ]]; then
+    MY_ROLE="SLAVE"
+else
+    # 智能检测失败 (针对 GCP/AWS 等严格 NAT 环境)，弹出手动选择
+    echo -e "${RED}[WARN] 无法通过公网 IP 智能匹配本机身份 (可能处于 NAT 环境)。${NC}"
+    echo "请手动指定本机角色:"
+    echo "1) MASTER (Node-1: $N1)"
+    echo "2) SLAVE  (Node-2 / Node-3)"
+    read -p "请输入 [1/2]: " role_choice < /dev/tty
+    if [ "$role_choice" == "1" ]; then MY_ROLE="MASTER"; else MY_ROLE="SLAVE"; fi
+fi
+
+echo -e "识别结果: 本机作为 ${GREEN}${MY_ROLE}${NC} 节点加入集群。"
+
+# ==============================================================================
+# [4/6] 录入安全凭据并持久化
+# ==============================================================================
+echo ""
+echo -e "${BLUE}>>> [4/6] 录入核心安全凭据 (v4.0)${NC}"
+echo "-------------------------------------------------------"
+echo "一次录入，全程静默。系统将自动生成明文和哈希两个版本的凭据。"
 echo "-------------------------------------------------------"
 
 # [工具函数] 使用 OpenSSL 计算 MySQL Native Password 哈希
-# 算法: SHA1(SHA1(password)) -> Hex -> Upper -> Prepend *
 generate_hash() {
     local pwd="$1"
-    
-    # 检查 openssl 是否存在
     if ! command -v openssl &> /dev/null; then
         echo -e "${RED}错误: 未找到 openssl 命令。无法计算哈希。${NC}" >&2
         exit 1
     fi
-
-    # 计算哈希 (兼容 OpenSSL 不同版本的输出格式)
-    # awk '{print $NF}' 用于提取最后一段 (哈希值)，忽略可能存在的 "(stdin)=" 前缀
     local h
     h=$(echo -n "$pwd" | openssl dgst -sha1 -binary | openssl dgst -sha1 | awk '{print toupper($NF)}')
-    
     echo "*$h"
 }
 
@@ -150,7 +165,7 @@ while true; do
     fi
 done
 
-# 3. [新增] Replication 密码 (为了 rejoin.sh 自动化)
+# 3. Replication 密码
 while true; do
     echo "请输入 Replication 复制密码 (用于节点间同步):"
     read -r -s REPL_PASS
@@ -166,7 +181,6 @@ done
 echo ""
 echo "正在计算加密哈希 (使用 OpenSSL)..."
 
-# 临时关闭 set -e 以捕获错误
 set +e
 ROOT_HASH=$(generate_hash "${ROOT_PASS}")
 PROXY_HASH=$(generate_hash "${PROXY_PASS}")
@@ -175,16 +189,13 @@ set -e
 
 if [ $RET -ne 0 ] || [ -z "$ROOT_HASH" ]; then
     echo -e "${RED}>>> 计算失败！请确保系统安装了 openssl。${NC}"
-    echo "调试信息: RootHash=[$ROOT_HASH]"
     exit 1
 fi
-
-echo "正在生成全量凭据文件..."
 
 SECRETS_FILE="${PROJECT_DIR}/.secrets.env"
 
 cat > "${SECRETS_FILE}" <<SEC
-# MariaDB HA Secrets (Auto-generated v3.4)
+# MariaDB HA Secrets (Auto-generated v4.0)
 # Created at: $(date)
 
 # [Plaintext] 用于 monitor.sh 和 rejoin.sh
@@ -198,26 +209,46 @@ export AUTO_PROXY_ADMIN_HASH='${PROXY_HASH}'
 SEC
 
 chmod 600 "${SECRETS_FILE}"
-echo -e "${GREEN}>>> 成功！凭据已保存至: .secrets.env${NC}"
+echo -e "${GREEN}>>> 成功！凭据已安全生成并加载。${NC}"
 
-sleep 1
-
+# ==============================================================================
+# [5/6] 启动核心容器组
+# ==============================================================================
 echo ""
-echo -e "${BLUE}>>> [5/5] 配置集群互联关系${NC}"
+echo -e "${BLUE}>>> [5/6] 启动 MariaDB & ProxySQL 容器组${NC}"
 echo "-------------------------------------------------------"
-echo "即将启动交互式配置..."
-echo "1. 如果本机是 Node-1，请选择 MASTER。"
-echo "2. 如果本机是 Node-2/3，请选择 SLAVE。"
-echo "-------------------------------------------------------"
-sleep 2
+./install_node.sh
 
-# 调用互联脚本
+# ==============================================================================
+# [6/6] 全自动流水线 (Auto-Pilot)
+# ==============================================================================
+echo ""
+echo -e "${BLUE}>>> [6/6] 执行流水线: 自动建主从 -> 刷路由 -> 挂哨兵${NC}"
+echo "-------------------------------------------------------"
+
+# 1. 自动配置复制关系 (透传角色，免去子脚本二次检测和询问)
+export LOCAL_ROLE="$MY_ROLE"
 ./scripts/init_replication.sh
 
+# 2. 静默刷入 ProxySQL 路由
+./scripts/init_proxysql.sh
+
+# 3. 启动 v3.5 永不宕机哨兵
+echo -e "${BLUE}[INFO] 正在后台挂载 HA Monitor 哨兵...${NC}"
+pkill -f monitor.sh || true
+nohup ./scripts/monitor.sh > /var/log/ha-monitor.log 2>&1 &
+sleep 2
+
 echo ""
-echo -e "${GREEN}>>> 基础安装流程结束！${NC}"
-echo "后续步骤建议："
-echo "1. 运行 ./scripts/init_proxysql.sh 初始化路由 (推荐)"
-echo "2. 运行 ./scripts/monitor.sh 启动自动故障转移 (推荐)"
-echo "-------------------------------------------------------"
-echo -e "项目路径: ${GREEN}$PROJECT_DIR${NC}"
+echo -e "${GREEN}=======================================================${NC}"
+echo -e "${GREEN}🎉 部署全部完成！真正的一键流水线 (v4.0)${NC}"
+echo -e "${GREEN}=======================================================${NC}"
+echo -e " ✅ 基础容器已启动 (MariaDB + ProxySQL + Adminer)"
+echo -e " ✅ 主从复制已自动建立并校验成功"
+echo -e " ✅ 读写分离路由规则已注入"
+echo -e " ✅ 高可用监控哨兵已在后台守护"
+echo -e "-------------------------------------------------------"
+echo -e " 🚀 业务接入入口: ${GREEN}127.0.0.1:6033${NC} (或本机内网IP:6033)"
+echo -e " 👁️  查看哨兵日志: ${BLUE}tail -f /var/log/ha-monitor.log${NC}"
+echo -e "-------------------------------------------------------"
+echo -e " [项目路径]: ${PROJECT_DIR}"

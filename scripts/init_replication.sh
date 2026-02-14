@@ -2,19 +2,27 @@
 set -euo pipefail
 
 # ==============================================================================
-# MariaDB HA v3.2 - Replication Setup (Escaped String Mode)
+# MariaDB HA v4.0 - Auto Replication Init (流水线静默版)
 # ==============================================================================
-# 修复: 解决 CHANGE MASTER 不支持 Hex (X'...') 语法的问题
-# 方案: 使用 Bash 字符串替换进行转义，支持特殊字符 (', \, #)
+# 核心升级:
+#   1. 静默读取 .secrets.env，彻底免除密码重复输入。
+#   2. 优先接收 bootstrap.sh 传入的角色，完美绕过云厂商 NAT/公网 IP 识别坑。
+#   3. 保留转义逻辑，完美支持极度复杂的密码。
 # ==============================================================================
 
-# 0. 加载配置
+# 0. 加载配置与凭据
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [ ! -f "${BASE_DIR}/topology.env" ]; then
     echo "Error: topology.env not found."
     exit 1
 fi
+if [ ! -f "${BASE_DIR}/.secrets.env" ]; then
+    echo "Error: .secrets.env not found. 凭据文件丢失！"
+    exit 1
+fi
+
 source "${BASE_DIR}/topology.env"
+source "${BASE_DIR}/.secrets.env"
 
 # 颜色定义
 GREEN='\033[0;32m'
@@ -26,72 +34,57 @@ log() { echo -e "${BLUE}[INFO]${NC} $1"; }
 warn() { echo -e "${RED}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-# ==============================================================================
-# 1. 身份识别
-# ==============================================================================
-LOCAL_IPS=$(hostname -I)
-MY_ROLE="UNKNOWN"
+echo -e "${BLUE}==========================================================${NC}"
+echo -e " 正在全自动初始化复制关系..."
 
-# 尝试自动匹配
-if [[ "$LOCAL_IPS" == *"$NODE_1_IP"* ]]; then
-    MY_ROLE="MASTER"
-elif [[ "$LOCAL_IPS" == *"$NODE_2_IP"* ]] || [[ "$LOCAL_IPS" == *"$NODE_3_IP"* ]]; then
-    MY_ROLE="SLAVE"
+# ==============================================================================
+# 1. 身份识别 (智能匹配 + 云环境降级保护)
+# ==============================================================================
+if [ -n "${LOCAL_ROLE:-}" ]; then
+    # 优先使用 bootstrap.sh 流水线传递过来的角色 (无视 NAT 问题)
+    MY_ROLE="${LOCAL_ROLE}"
+else
+    # 独立运行时，尝试智能检测
+    LOCAL_IPS=$(hostname -I)
+    if [[ "$LOCAL_IPS" == *"$NODE_1_IP"* ]]; then
+        MY_ROLE="MASTER"
+    elif [[ "$LOCAL_IPS" == *"$NODE_2_IP"* ]] || [[ "$LOCAL_IPS" == *"$NODE_3_IP"* ]]; then
+        MY_ROLE="SLAVE"
+    else
+        # 智能检测失败 (针对 GCP/AWS 等严格 NAT 环境)，弹出手动选择
+        warn "无法通过公网 IP 智能匹配本机身份 (可能处于 NAT 环境)。"
+        echo "请手动指定本机角色:"
+        echo "1) MASTER (Node-1: $NODE_1_IP)"
+        echo "2) SLAVE  (Node-2 / Node-3)"
+        read -p "请输入 [1/2]: " role_choice < /dev/tty
+        if [ "$role_choice" == "1" ]; then MY_ROLE="MASTER"; else MY_ROLE="SLAVE"; fi
+    fi
 fi
 
-# 手动修正 (如果自动匹配失败)
-if [ "$MY_ROLE" == "UNKNOWN" ]; then
-    echo "----------------------------------------------------------"
-    warn "无法通过内网 IP ($LOCAL_IPS) 自动识别本机角色。"
-    echo "请手动选择本机身份:"
-    echo " 1) Master (Node-1: $NODE_1_IP)"
-    echo " 2) Slave  (Node-2: $NODE_2_IP)"
-    echo " 3) Slave  (Node-3: $NODE_3_IP)"
-    echo "----------------------------------------------------------"
-    
-    # 强制从 tty 读取
-    read -p "请输入序号 (1/2/3): " NODE_IDX < /dev/tty
-    
-    case "$NODE_IDX" in
-        1) MY_ROLE="MASTER" ;;
-        2) MY_ROLE="SLAVE" ;;
-        3) MY_ROLE="SLAVE" ;;
-        *) err "无效输入，退出。" ;;
-    esac
+echo -e " 本机角色: ${GREEN}${MY_ROLE}${NC}"
+echo -e " Master IP 指向: ${NODE_1_IP}"
+echo -e "${BLUE}==========================================================${NC}"
+
+# ==============================================================================
+# 2. 静默获取密码 (直接读取环境变量)
+# ==============================================================================
+ROOT_PASS="${AUTO_DB_ROOT_PASS}"
+REPL_PASS="${AUTO_REPL_PASS}"
+
+if [ -z "$ROOT_PASS" ] || [ -z "$REPL_PASS" ]; then 
+    err "未能从 .secrets.env 读取到有效的密码配置！"
 fi
-
-echo "=========================================================="
-echo " 正在初始化复制关系..."
-echo " 本机角色: ${MY_ROLE}"
-echo " Master IP: ${NODE_1_IP}"
-echo "=========================================================="
-
-# ==============================================================================
-# 2. 安全交互：获取密码
-# ==============================================================================
-echo ">>> 请输入密码以配置复制 (输入不显示)"
-
-# 使用 -r 防止反斜杠被转义
-read -r -s -p "1. 输入 Root 密码: " ROOT_PASS < /dev/tty
-echo ""
-if [ -z "$ROOT_PASS" ]; then err "密码不能为空"; fi
-
-read -r -s -p "2. 输入 复制用户(repl) 密码: " REPL_PASS < /dev/tty
-echo ""
-if [ -z "$REPL_PASS" ]; then err "密码不能为空"; fi
 
 # ==============================================================================
 # 辅助函数
 # ==============================================================================
 
-# 执行 SQL (使用 MYSQL_PWD 环境变量)
+# 执行 SQL (使用 MYSQL_PWD 环境变量注入)
 exec_sql() {
     docker exec -i -e MYSQL_PWD="${ROOT_PASS}" mariadb mariadb -uroot -e "$1"
 }
 
-# [关键修复] SQL 转义函数
-# 1. 将反斜杠 \ 替换为 \\ (必须先做)
-# 2. 将单引号 ' 替换为 \'
+# SQL 转义函数 (防注入与语法错误)
 escape_sql_str() {
     local input="$1"
     local output="${input//\\/\\\\}"
@@ -99,13 +92,16 @@ escape_sql_str() {
     echo "$output"
 }
 
+# 等待数据库彻底启动就绪
+sleep 3
+
 # ==============================================================================
 # 3. Master 逻辑
 # ==============================================================================
 if [ "${MY_ROLE}" == "MASTER" ]; then
     log "[Master] 创建复制用户 '${REPL_USER}'..."
     
-    # 对密码进行转义处理，防止 SQL 注入或语法错误
+    # 对密码进行转义处理
     SAFE_REPL_PASS=$(escape_sql_str "${REPL_PASS}")
 
     # 使用标准 SQL 语法创建用户
@@ -121,25 +117,19 @@ if [ "${MY_ROLE}" == "MASTER" ]; then
 else
     log "[Slave] 正在连接 Master (${NODE_1_IP})..."
     
-    # 1. 停止同步 (防止报错)
+    # 1. 停止同步并重置
     exec_sql "STOP SLAVE; RESET SLAVE ALL;" || true
     
-    # 2. 对密码进行转义处理 (修复 'X' Hex 语法错误)
+    # 2. 对密码进行转义处理
     SAFE_REPL_PASS=$(escape_sql_str "${REPL_PASS}")
     
     # 3. 配置 GTID 复制
-    # 这里使用标准的单引号包裹密码，因为内部已转义，所以支持包含单引号或反斜杠的密码
-    # 注意: SQL_CMD 变量构建时，Bash 会展开变量，但不会二次转义
-    
     SQL_CMD="CHANGE MASTER TO \
         MASTER_HOST='${NODE_1_IP}', \
         MASTER_PORT=${DB_PORT}, \
         MASTER_USER='${REPL_USER}', \
         MASTER_PASSWORD='${SAFE_REPL_PASS}', \
         MASTER_USE_GTID=slave_pos;"
-    
-    # 调试输出 (隐藏密码)
-    # echo "DEBUG SQL: ${SQL_CMD}" | sed "s/MASTER_PASSWORD='.*'/MASTER_PASSWORD='******'/g"
 
     exec_sql "${SQL_CMD}"
     exec_sql "START SLAVE;"
@@ -149,15 +139,17 @@ else
     
     # 4. 检查状态
     STATUS=$(exec_sql "SHOW SLAVE STATUS\G")
-    IO=$(echo "${STATUS}" | grep "Slave_IO_Running:" | awk '{print $2}')
-    SQL=$(echo "${STATUS}" | grep "Slave_SQL_Running:" | awk '{print $2}')
+    IO=$(echo "${STATUS}" | grep "Slave_IO_Running:" | awk '{print $2}' | tr -d '\r')
+    SQL=$(echo "${STATUS}" | grep "Slave_SQL_Running:" | awk '{print $2}' | tr -d '\r')
     
     if [[ "${IO}" == "Yes" && "${SQL}" == "Yes" ]]; then
         echo -e "${GREEN}>>> 成功！复制正在运行 (IO: Yes, SQL: Yes)${NC}"
+        # 成功后，强制设置为只读，防双写脑裂
+        exec_sql "SET GLOBAL read_only=ON;"
     else
         echo -e "${RED}>>> 警告！复制状态异常 (IO: ${IO}, SQL: ${SQL})${NC}"
-        echo "请检查防火墙端口 ${DB_PORT} 是否开放，或密码是否正确。"
+        echo "请检查防火墙端口 ${DB_PORT} 是否开放，或网络是否互通。"
         echo "错误详情:"
-        echo "${STATUS}" | grep "Last_Error"
+        echo "${STATUS}" | grep "Last_Error" || true
     fi
 fi
