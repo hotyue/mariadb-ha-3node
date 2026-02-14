@@ -153,7 +153,7 @@ log "正在修正 ProxySQL 路由..."
 
 # 修正路由表：将 HG 10 (写) 指向新 Master，将 HG 20 (读) 包含所有节点
 # 注意：这里会清空 HG10 并重新指向新主，这是最安全的做法
-docker exec -e MYSQL_PWD="${PROXY_ADMIN_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-EOF
+docker exec -i -e MYSQL_PWD="${PROXY_ADMIN_PASS}" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-EOF
     DELETE FROM mysql_servers WHERE hostgroup_id=10;
     INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (10, '${NEW_MASTER_IP}', 3306);
     

@@ -79,7 +79,7 @@ promote_self_to_master() {
 switch_proxysql_routing() {
     local new_writer_ip=$1
     log ">>> [ProxySQL Action] 更新本地路由表 (HG 10) 指向: $new_writer_ip"
-    docker exec -e MYSQL_PWD="$AUTO_PROXY_ADMIN_PASS" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL >> "$LOG_FILE" 2>&1
+    docker exec -i -e MYSQL_PWD="$AUTO_PROXY_ADMIN_PASS" proxysql mysql -u admin -h 127.0.0.1 -P 6032 <<-SQL >> "$LOG_FILE" 2>&1
         DELETE FROM mysql_servers WHERE hostgroup_id=10;
         INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (10, '$new_writer_ip', 3306);
         LOAD MYSQL SERVERS TO RUNTIME;
