@@ -7,6 +7,8 @@
 #   2. 礼让机制：低优先级节点在故障时强制等待，优先由高优先级节点接管。
 #   3. 上位授权 (v4.1 新增)：新主上位时自动刷新 repl_user 权限，确保旧主归队顺畅。
 #   4. 动态寻主：永远以 ProxySQL 的 HG 10 配置作为监控准则。
+#   5. [架构适配] 完美兼容开机强制双重只读锁 (super_read_only)。
+#   6. [架构适配] 增加全线故障重启后的“无主强制推举”预案。
 # ==============================================================================
 
 set -u
@@ -77,9 +79,10 @@ promote_self_to_master() {
     local SAFE_REPL_PASS="${AUTO_REPL_PASS//\\/\\\\}"
     SAFE_REPL_PASS="${SAFE_REPL_PASS//\'/\\\'}"
 
-    # 停止同步，解开只读，同时强制授予复制权限，确保后续节点可顺利归队
+    # [架构适配] 停止同步，解开双重只读锁，同时强制授予复制权限，确保后续节点可顺利归队
     docker exec -e MYSQL_PWD="$AUTO_DB_ROOT_PASS" mariadb mariadb -h 127.0.0.1 -uroot -e \
-        "STOP SLAVE; RESET SLAVE ALL; SET GLOBAL read_only=0; \
+        "SET GLOBAL super_read_only=0; SET GLOBAL read_only=0; \
+        STOP SLAVE; RESET SLAVE ALL; \
         CREATE USER IF NOT EXISTS '${REPL_USER}'@'%' IDENTIFIED BY '${SAFE_REPL_PASS}'; \
         GRANT REPLICATION SLAVE ON *.* TO '${REPL_USER}'@'%'; \
         FLUSH PRIVILEGES;" >> "$LOG_FILE" 2>&1
@@ -138,9 +141,21 @@ while true; do
                 fi
             done
 
+            # [架构适配] 处理全线断电重启导致的所有节点皆为只读（无主）的极端情况
             if [ -z "$NEW_MASTER" ]; then
-                log "[Fatal] 全线崩溃，无存活节点！"
-                FAIL_COUNT=0; sleep 10; continue
+                log "[Warn] 找不到活跃的备选 Master。准备从存活节点中强制推举..."
+                for ip in "${CANDIDATE_LIST[@]}"; do
+                    if check_node_health "$ip"; then
+                        NEW_MASTER="$ip"
+                        log ">>> [Arbitration] 强制推举 $NEW_MASTER 作为新 Master！"
+                        break
+                    fi
+                done
+                
+                if [ -z "$NEW_MASTER" ]; then
+                    log "[Fatal] 物理全线崩溃，无存活节点！等待恢复..."
+                    FAIL_COUNT=0; sleep 10; continue
+                fi
             fi
 
             log ">>> 选举共识：幸存者中优先级最高的是 $NEW_MASTER"

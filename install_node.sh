@@ -3,6 +3,7 @@ set -e
 
 # ==============================================================================
 # MariaDB HA v4.0 - Node Installer (Docker Compose + NAT Support + 静默版)
+# [架构加固版] 增加 MariaDB 容器级强制只读启动配置防“脑裂偷写”
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -101,6 +102,8 @@ services:
       --gtid-strict-mode=ON
       --log-slave-updates=ON
       --bind-address=0.0.0.0
+      --read-only=1
+      --super-read-only=1
     volumes:
       - ./data/mysql:/var/lib/mysql
       - ./conf/my.cnf:/etc/mysql/conf.d/custom.cnf
