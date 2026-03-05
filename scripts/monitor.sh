@@ -81,7 +81,7 @@ promote_self_to_master() {
 
     # [架构适配] 停止同步，解开双重只读锁，同时强制授予复制权限，确保后续节点可顺利归队
     docker exec -e MYSQL_PWD="$AUTO_DB_ROOT_PASS" mariadb mariadb -h 127.0.0.1 -uroot -e \
-        "SET GLOBAL super_read_only=0; SET GLOBAL read_only=0; \
+        "SET GLOBAL read_only=0; \
         STOP SLAVE; RESET SLAVE ALL; \
         CREATE USER IF NOT EXISTS '${REPL_USER}'@'%' IDENTIFIED BY '${SAFE_REPL_PASS}'; \
         GRANT REPLICATION SLAVE ON *.* TO '${REPL_USER}'@'%'; \

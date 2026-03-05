@@ -103,7 +103,6 @@ services:
       --log-slave-updates=ON
       --bind-address=0.0.0.0
       --read-only=1
-      --super-read-only=1
     volumes:
       - ./data/mysql:/var/lib/mysql
       - ./conf/my.cnf:/etc/mysql/conf.d/custom.cnf

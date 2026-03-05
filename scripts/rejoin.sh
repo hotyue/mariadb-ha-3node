@@ -10,7 +10,6 @@ set -u
 #   3. 全量凭据静默流转：支持复杂密码转义与 SSL 警告过滤。
 #   4. 哨兵守护：配合 KillMode=process 确保归队后监控进程持续运行。
 #   5. [终极加固] 强制使用 TCP 注入，屏蔽特殊字符引起的 Shell 变量异常展开。
-#   6. [架构适配] 新增 super_read_only 解锁与回锁逻辑，完美适配强制开机只读架构。
 # ==============================================================================
 
 # 自动获取脚本绝对路径，确保 Systemd 环境下能定位到同级脚本
@@ -109,9 +108,7 @@ SAFE_REPL_PASS="${AUTO_REPL_PASS//\\/\\\\}"
 SAFE_REPL_PASS="${SAFE_REPL_PASS//\'/\\\'}"
 
 # [终极修复] 使用 -h127.0.0.1 走 TCP 协议，并使用标准 EOF 防止不可控缩进打断 SQL
-# [架构修复] 临时解开 super_read_only 锁，执行完毕后双重锁死防偷写
 docker exec -i -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -h127.0.0.1 -uroot <<EOF
-SET GLOBAL super_read_only=0;
 STOP SLAVE;
 RESET SLAVE ALL;
 CHANGE MASTER TO 
@@ -122,7 +119,6 @@ CHANGE MASTER TO
     MASTER_USE_GTID=slave_pos;
 START SLAVE;
 SET GLOBAL read_only=ON;
-SET GLOBAL super_read_only=ON;
 EOF
 
 sleep 3
