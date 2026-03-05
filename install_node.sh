@@ -88,7 +88,7 @@ services:
   mariadb:
     image: ${MARIADB_IMAGE}
     container_name: mariadb
-    restart: always
+    restart: no
     network_mode: "host"
     environment:
       MARIADB_ROOT_PASSWORD: "\${DB_ROOT_PASS}"

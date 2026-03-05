@@ -1,11 +1,11 @@
 #!/bin/bash
 # ==============================================================================
-# MariaDB HA v4.0 - Mutual Exclusion Monitor (互斥仲裁哨兵)
+# MariaDB HA v4.1 - Mutual Exclusion Monitor (互斥仲裁哨兵 + 上位授权版)
 # ==============================================================================
 # 核心特性:
 #   1. 优先级协商：Node 1 > Node 2 > Node 3，彻底根除双主脑裂。
 #   2. 礼让机制：低优先级节点在故障时强制等待，优先由高优先级节点接管。
-#   3. TCP 探测：强制使用 -h127.0.0.1 避开 Socket 竞争。
+#   3. 上位授权 (v4.1 新增)：新主上位时自动刷新 repl_user 权限，确保旧主归队顺畅。
 #   4. 动态寻主：永远以 ProxySQL 的 HG 10 配置作为监控准则。
 # ==============================================================================
 
@@ -38,7 +38,7 @@ if [[ "$LOCAL_IPS" == *"$NODE_2_IP"* ]]; then MY_PRIO=20; MY_IP="$NODE_2_IP"; fi
 if [[ "$LOCAL_IPS" == *"$NODE_3_IP"* ]]; then MY_PRIO=30; MY_IP="$NODE_3_IP"; fi
 
 log "=========================================================="
-log ">>> 哨兵启动 (Monitor v4.0 Mutual Exclusion)"
+log ">>> 哨兵启动 (Monitor v4.1 Mutual Exclusion)"
 log ">>> 本机优先级: $MY_PRIO (IP: $MY_IP)"
 log "=========================================================="
 
@@ -69,12 +69,26 @@ is_node_master() {
     return 1 # 还是从
 }
 
-# 提升本机为 Master
+# 提升本机为 Master (v4.1 核心修复：增加授权逻辑)
 promote_self_to_master() {
-    log ">>> [DB Action] 我是优先级最高的存活节点，正在提升为主库..."
+    log ">>> [DB Action] 我是优先级最高的存活节点，正在提升为主库并开启授权..."
+    
+    # 对密码中的特殊字符进行安全转义，防止破坏 SQL 语法
+    local SAFE_REPL_PASS="${AUTO_REPL_PASS//\\/\\\\}"
+    SAFE_REPL_PASS="${SAFE_REPL_PASS//\'/\\\'}"
+
+    # 停止同步，解开只读，同时强制授予复制权限，确保后续节点可顺利归队
     docker exec -e MYSQL_PWD="$AUTO_DB_ROOT_PASS" mariadb mariadb -h 127.0.0.1 -uroot -e \
-        "STOP SLAVE; RESET SLAVE ALL; SET GLOBAL read_only=0;" >> "$LOG_FILE" 2>&1
-    log ">>> [Success] 数据库提升完成。"
+        "STOP SLAVE; RESET SLAVE ALL; SET GLOBAL read_only=0; \
+        CREATE USER IF NOT EXISTS '${REPL_USER}'@'%' IDENTIFIED BY '${SAFE_REPL_PASS}'; \
+        GRANT REPLICATION SLAVE ON *.* TO '${REPL_USER}'@'%'; \
+        FLUSH PRIVILEGES;" >> "$LOG_FILE" 2>&1
+        
+    if [ $? -eq 0 ]; then
+        log ">>> [Success] 数据库提升与复制账号授权完成。"
+    else
+        log ">>> [Error] 数据库提升失败，请检查日志！"
+    fi
 }
 
 # 切换本地 ProxySQL 路由

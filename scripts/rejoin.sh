@@ -2,13 +2,14 @@
 set -u
 
 # ==============================================================================
-# MariaDB HA v4.0 - 节点智能归队程序 (Auto-Rejoin 终极版)
+# MariaDB HA v4.2 - 节点智能归队程序 (Auto-Rejoin 终极加固版)
 # ==============================================================================
 # 核心升级:
 #   1. 智能冷启动探测：取代死板 sleep，确保容器内部 mysqld 就绪后再执行 SQL。
 #   2. 绝对路径自适应：完美支持 Systemd 开机自启环境。
 #   3. 全量凭据静默流转：支持复杂密码转义与 SSL 警告过滤。
 #   4. 哨兵守护：配合 KillMode=process 确保归队后监控进程持续运行。
+#   5. [终极加固] 强制使用 TCP 注入，屏蔽特殊字符引起的 Shell 变量异常展开。
 # ==============================================================================
 
 # 自动获取脚本绝对路径，确保 Systemd 环境下能定位到同级脚本
@@ -30,7 +31,7 @@ ok() { echo -e "${GREEN}[OK]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 echo "----------------------------------------------------------"
-echo -e "${BLUE}>>> MariaDB HA 节点归队程序 (v4.0 Auto-Pilot)${NC}"
+echo -e "${BLUE}>>> MariaDB HA 节点归队程序 (v4.2 Auto-Pilot)${NC}"
 echo "----------------------------------------------------------"
 
 # ==============================================================================
@@ -53,7 +54,7 @@ log "正在等待 MariaDB 内部 SQL 服务就绪..."
 DB_READY=false
 for i in {1..30}; do
     # 探测本地数据库是否响应，同时过滤掉可能的客户端 SSL 警告
-    if docker exec -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -uroot -e "SELECT 1;" >/dev/null 2>&1; then
+    if docker exec -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -h127.0.0.1 -uroot -e "SELECT 1;" >/dev/null 2>&1; then
         DB_READY=true
         ok "MariaDB 内部服务已就绪。"
         break
@@ -101,32 +102,35 @@ log "3. 强制同步本地 ProxySQL 路由表"
 log "4. 在后台拉起监控哨兵"
 echo "----------------------------------------------------------"
 
-log "正在配置 MariaDB 复制关系..."
+log "正在配置 MariaDB 复制关系 (特殊字符加固模式)..."
 # 复杂密码转义处理
 SAFE_REPL_PASS="${AUTO_REPL_PASS//\\/\\\\}"
 SAFE_REPL_PASS="${SAFE_REPL_PASS//\'/\\\'}"
 
-docker exec -i -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -uroot <<-EOSQL
-    STOP SLAVE;
-    RESET SLAVE ALL;
-    CHANGE MASTER TO 
-        MASTER_HOST='${NEW_MASTER_IP}', 
-        MASTER_PORT=${DB_PORT}, 
-        MASTER_USER='${REPL_USER}', 
-        MASTER_PASSWORD='${SAFE_REPL_PASS}', 
-        MASTER_USE_GTID=slave_pos;
-    START SLAVE;
-    SET GLOBAL read_only=ON;
-EOSQL
+# [终极修复] 使用 -h127.0.0.1 走 TCP 协议，并使用标准 EOF 防止不可控缩进打断 SQL
+docker exec -i -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -h127.0.0.1 -uroot <<EOF
+STOP SLAVE;
+RESET SLAVE ALL;
+CHANGE MASTER TO 
+    MASTER_HOST='${NEW_MASTER_IP}', 
+    MASTER_PORT=${DB_PORT}, 
+    MASTER_USER='${REPL_USER}', 
+    MASTER_PASSWORD='${SAFE_REPL_PASS}', 
+    MASTER_USE_GTID=slave_pos;
+START SLAVE;
+SET GLOBAL read_only=ON;
+EOF
 
-sleep 2
+sleep 3
 # 验证 IO 线程状态
-IO_STATUS=$(docker exec -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -uroot -e "SHOW SLAVE STATUS\G" | grep "Slave_IO_Running:" | awk '{print $2}' | tr -d '\r')
+IO_STATUS=$(docker exec -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -h127.0.0.1 -uroot -e "SHOW SLAVE STATUS\G" 2>/dev/null | grep "Slave_IO_Running:" | awk '{print $2}' | tr -d '\r')
 
 if [ "$IO_STATUS" == "Yes" ]; then
     ok "MariaDB 复制链路已成功建立。"
 else
-    err "复制建立失败！请手动检查网络连接或 Master 复制账号权限。"
+    echo -e "${RED}[DEBUG] 复制异常详情 (Last_IO_Error):${NC}"
+    docker exec -e MYSQL_PWD="${AUTO_DB_ROOT_PASS}" mariadb mariadb -h127.0.0.1 -uroot -e "SHOW SLAVE STATUS\G" 2>/dev/null | grep "Last_IO_Error" || true
+    err "复制建立失败！请确认 Master 节点已完成自动授权，且 UFW 放行了本机 IP。"
 fi
 
 log "正在同步本地 ProxySQL 路由规则..."
